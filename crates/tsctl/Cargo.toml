@@ -6,8 +6,12 @@ rust-version  = { workspace = true }
 license       = { workspace = true }
 repository    = { workspace = true }
 authors       = { workspace = true }
-description   = "TokenScope CLI (placeholder — fleshed out in Task 7)"
+description   = "TokenScope CLI"
 
 [[bin]]
 name = "tsctl"
 path = "src/main.rs"
+
+[dependencies]
+clap   = { workspace = true }
+anyhow = { workspace = true }
