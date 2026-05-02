@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ts-core",
+    "crates/ts-bpf-sys",
+    "crates/tsd",
+    "crates/tsctl",
+    "crates/tstop",
+]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2021"
+rust-version  = "1.83"
+license       = "Apache-2.0"
+repository    = "https://github.com/Dialovos/tokenscope"
+authors       = ["Hoang Le"]
+
+[workspace.dependencies]
+anyhow              = "1.0"
+thiserror           = "1.0"
+clap                = { version = "4.5", features = ["derive"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
+libbpf-rs           = "0.24"
+libbpf-cargo        = "0.24"
+tokio               = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
+
+# internal
+ts-core             = { path = "crates/ts-core" }
+ts-bpf-sys          = { path = "crates/ts-bpf-sys" }
+
+[profile.release]
+lto             = "thin"
+codegen-units   = 1
+strip           = true
+debug           = false
+panic           = "abort"
+
+[profile.dev]
+debug = true

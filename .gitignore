@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+Cargo.lock.*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+# BPF build artifacts
+bpf/*.bpf.o
+# Local BTF dumps fetched at install time
+vmlinux/btf-cache/
+# DuckDB / data dirs created at runtime
+*.duckdb
+*.duckdb.wal
+/data/
