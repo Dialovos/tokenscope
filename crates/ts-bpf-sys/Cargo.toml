@@ -6,4 +6,12 @@ rust-version  = { workspace = true }
 license       = { workspace = true }
 repository    = { workspace = true }
 authors       = { workspace = true }
-description   = "TokenScope BPF skeletons (placeholder — fleshed out in Task 5)"
+description   = "Compiles TokenScope BPF programs and exposes libbpf-cargo skeletons"
+build         = "build.rs"
+links         = "ts-bpf-sys-skel"
+
+[dependencies]
+libbpf-rs = { workspace = true }
+
+[build-dependencies]
+libbpf-cargo = { workspace = true }
