@@ -6,8 +6,12 @@ rust-version  = { workspace = true }
 license       = { workspace = true }
 repository    = { workspace = true }
 authors       = { workspace = true }
-description   = "TokenScope TUI (placeholder — fleshed out in Task 8)"
+description   = "TokenScope live TUI"
 
 [[bin]]
 name = "tstop"
 path = "src/main.rs"
+
+[dependencies]
+clap   = { workspace = true }
+anyhow = { workspace = true }
