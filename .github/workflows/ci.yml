@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              clang \
+              libbpf-dev \
+              linux-tools-common \
+              linux-tools-generic \
+              "linux-tools-$(uname -r)" || \
+            sudo apt-get install -y --no-install-recommends linux-tools-generic
+          # bpftool from the linux-tools-generic package may live under a kernel-versioned dir
+          if ! command -v bpftool >/dev/null; then
+            sudo ln -sf "$(find /usr/lib/linux-tools* -name bpftool | head -1)" /usr/local/bin/bpftool
+          fi
+          bpftool version
+
+      - name: Generate vmlinux.h for the runner kernel
+        run: |
+          if [[ -r /sys/kernel/btf/vmlinux ]]; then
+              sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+              wc -l bpf/vmlinux.h
+          else
+              ./vmlinux/fetch-btf.sh
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test (unit, non-root)
+        run: cargo test --workspace --all-targets
+
+      - name: cargo test (integration, root, sched_exec)
+        run: |
+          sudo -E env "PATH=$PATH" \
+              "$(command -v cargo)" test -p tsd \
+              -- --ignored --include-ignored --nocapture
