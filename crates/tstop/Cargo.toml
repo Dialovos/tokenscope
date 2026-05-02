@@ -1,0 +1,13 @@
+[package]
+name          = "tstop"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+description   = "TokenScope TUI (placeholder — fleshed out in Task 8)"
+
+[[bin]]
+name = "tstop"
+path = "src/main.rs"

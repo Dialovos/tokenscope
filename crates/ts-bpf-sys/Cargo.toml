@@ -1,0 +1,9 @@
+[package]
+name          = "ts-bpf-sys"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+description   = "TokenScope BPF skeletons (placeholder — fleshed out in Task 5)"
