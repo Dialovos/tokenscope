@@ -24,10 +24,24 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
-### Phase 0 — Foundations (in progress, target tag `v0.0.1-phase0`)
-Workspace scaffold, libbpf-rs skeleton pipeline, single `sched_process_exec` probe end-to-end, basic GitHub Actions CI on Ubuntu 22.04 + 24.04.
+### Phase 0 — Foundations (shipped 2026-05-02, tag `v0.0.1-phase0`)
 
-Gate: `cargo test --workspace` green; `sudo ./target/debug/tsd` prints exec events; CI green on both runners.
+Workspace scaffold (`ts-core`, `ts-bpf-sys`, `tsd`, `tsctl`, `tstop`); libbpf-cargo skeleton build pipeline; `bpf/sched_exec.bpf.c` tracepoint emitting `TsEventHdr` records through a 256 KiB ringbuf; `tsd` drains and prints them; GitHub Actions CI on Ubuntu 22.04 + 24.04.
+
+**Gate evidence:**
+- `cargo fmt --check` clean
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo test --workspace` — 5/5 ts-core unit tests pass
+- `sudo cargo test -p tsd -- --ignored --nocapture captures_exec_event_for_child` — passes (captured `TsEventHdr { kind: ProcExec, pid: 76682, ... }` after `/bin/true`)
+- Plan: `docs/superpowers/plans/2026-05-02-phase-0-foundations.md`
+
+**Toolchain pinned to Rust 1.85** (libbpf-cargo's transitive deps require edition2024).
+
+**Known gaps left for later phases:**
+- vng kernel matrix CI (deferred to Phase 7)
+- BPF program does not yet capture `comm`/`cmdline` payload (Phase 1)
+- No config file; daemon uses defaults only (Phase 1)
+- `tsctl`/`tstop` are stubs (Phase 1+/Phase 2)
 
 ## Configuration
 
