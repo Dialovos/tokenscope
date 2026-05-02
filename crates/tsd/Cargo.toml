@@ -6,8 +6,16 @@ rust-version  = { workspace = true }
 license       = { workspace = true }
 repository    = { workspace = true }
 authors       = { workspace = true }
-description   = "TokenScope daemon (placeholder — fleshed out in Task 6)"
+description   = "TokenScope daemon"
 
 [[bin]]
 name = "tsd"
 path = "src/main.rs"
+
+[dependencies]
+ts-core             = { workspace = true }
+ts-bpf-sys          = { workspace = true }
+anyhow              = { workspace = true }
+clap                = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
