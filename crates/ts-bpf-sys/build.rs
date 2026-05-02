@@ -9,9 +9,7 @@ use libbpf_cargo::SkeletonBuilder;
 
 /// Each entry: (BPF source filename, generated skeleton filename).
 /// Add new probes here as they're written.
-const PROGRAMS: &[(&str, &str)] = &[
-    ("sched_exec.bpf.c", "sched_exec.skel.rs"),
-];
+const PROGRAMS: &[(&str, &str)] = &[("sched_exec.bpf.c", "sched_exec.skel.rs")];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -32,10 +30,7 @@ fn main() {
             .clang_args(["-I", bpf_dir.to_str().unwrap()])
             .build_and_generate(&skel)
             .unwrap_or_else(|e| {
-                panic!(
-                    "failed to build BPF skeleton for {}: {e}",
-                    src.display()
-                );
+                panic!("failed to build BPF skeleton for {}: {e}", src.display());
             });
     }
 }

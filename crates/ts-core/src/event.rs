@@ -7,18 +7,18 @@ use core::mem::{align_of, size_of};
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsEventType {
-    NetConnect    = 1,
-    NetBytes      = 2,
-    TlsPlaintext  = 3,
-    LlmReqStart   = 4,
-    LlmReqEnd     = 5,
-    LlmToken      = 6,
-    ProcExec      = 7,
-    ProcExit      = 8,
-    CgroupNew     = 9,
-    CgroupGone    = 10,
-    Anomaly       = 11,
-    GpuSample     = 12,
+    NetConnect = 1,
+    NetBytes = 2,
+    TlsPlaintext = 3,
+    LlmReqStart = 4,
+    LlmReqEnd = 5,
+    LlmToken = 6,
+    ProcExec = 7,
+    ProcExit = 8,
+    CgroupNew = 9,
+    CgroupGone = 10,
+    Anomaly = 11,
+    GpuSample = 12,
 }
 
 impl TsEventType {
@@ -27,19 +27,19 @@ impl TsEventType {
     /// the BPF program — never panic.
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
-            1  => Some(Self::NetConnect),
-            2  => Some(Self::NetBytes),
-            3  => Some(Self::TlsPlaintext),
-            4  => Some(Self::LlmReqStart),
-            5  => Some(Self::LlmReqEnd),
-            6  => Some(Self::LlmToken),
-            7  => Some(Self::ProcExec),
-            8  => Some(Self::ProcExit),
-            9  => Some(Self::CgroupNew),
+            1 => Some(Self::NetConnect),
+            2 => Some(Self::NetBytes),
+            3 => Some(Self::TlsPlaintext),
+            4 => Some(Self::LlmReqStart),
+            5 => Some(Self::LlmReqEnd),
+            6 => Some(Self::LlmToken),
+            7 => Some(Self::ProcExec),
+            8 => Some(Self::ProcExit),
+            9 => Some(Self::CgroupNew),
             10 => Some(Self::CgroupGone),
             11 => Some(Self::Anomaly),
             12 => Some(Self::GpuSample),
-            _  => None,
+            _ => None,
         }
     }
 }
@@ -61,13 +61,13 @@ impl TsEventType {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TsEventHdr {
-    pub ts_ns:     u64,
-    pub cpu:       u32,
-    pub pid:       u32,
-    pub tgid:      u32,
+    pub ts_ns: u64,
+    pub cpu: u32,
+    pub pid: u32,
+    pub tgid: u32,
     pub cgroup_id: u64,
-    pub ty:        u16,
-    pub len:       u16,
+    pub ty: u16,
+    pub len: u16,
 }
 
 const _: () = assert!(size_of::<TsEventHdr>() == 40);
@@ -92,9 +92,7 @@ pub fn decode_header(buf: &[u8]) -> Result<TsEventHdr, DecodeError> {
             need: size_of::<TsEventHdr>(),
         });
     }
-    let hdr = unsafe {
-        core::ptr::read_unaligned(buf.as_ptr() as *const TsEventHdr)
-    };
+    let hdr = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const TsEventHdr) };
     let payload_avail = buf.len() - size_of::<TsEventHdr>();
     if hdr.len as usize > payload_avail {
         return Err(DecodeError::BadLength {
@@ -137,9 +135,7 @@ mod tests {
             ty: TsEventType::ProcExec as u16,
             len: 0,
         };
-        let bytes: [u8; 40] = unsafe {
-            core::mem::transmute(original)
-        };
+        let bytes: [u8; 40] = unsafe { core::mem::transmute(original) };
         let decoded = decode_header(&bytes).unwrap();
         assert_eq!(decoded.ts_ns, original.ts_ns);
         assert_eq!(decoded.cpu, original.cpu);
@@ -148,7 +144,10 @@ mod tests {
         assert_eq!(decoded.cgroup_id, original.cgroup_id);
         assert_eq!(decoded.ty, original.ty);
         assert_eq!(decoded.len, original.len);
-        assert_eq!(TsEventType::from_u16(decoded.ty), Some(TsEventType::ProcExec));
+        assert_eq!(
+            TsEventType::from_u16(decoded.ty),
+            Some(TsEventType::ProcExec)
+        );
     }
 
     #[test]
