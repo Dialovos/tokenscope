@@ -63,8 +63,19 @@ static __always_inline int emit_connect(struct bpf_sock_addr *ctx, __u16 family)
         __u32 ip4 = ctx->user_ip4;
         __builtin_memcpy(&r->pl.dst_addr[12], &ip4, 4);
     } else {
-        /* user_ip6 is __be32[4]; copy 16 bytes verbatim. */
-        __builtin_memcpy(r->pl.dst_addr, ctx->user_ip6, 16);
+        /* user_ip6 is __be32[4]. The BPF verifier disallows memcpy via a
+         * modified ctx pointer, so we must read each field individually.
+         * Each load is a u32 read from a named ctx field, which the
+         * verifier permits.
+         */
+        __u32 ip6_0 = ctx->user_ip6[0];
+        __u32 ip6_1 = ctx->user_ip6[1];
+        __u32 ip6_2 = ctx->user_ip6[2];
+        __u32 ip6_3 = ctx->user_ip6[3];
+        __builtin_memcpy(&r->pl.dst_addr[0], &ip6_0, 4);
+        __builtin_memcpy(&r->pl.dst_addr[4], &ip6_1, 4);
+        __builtin_memcpy(&r->pl.dst_addr[8], &ip6_2, 4);
+        __builtin_memcpy(&r->pl.dst_addr[12], &ip6_3, 4);
     }
 
     bpf_ringbuf_submit(r, 0);
