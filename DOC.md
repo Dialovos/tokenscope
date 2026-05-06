@@ -24,6 +24,23 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.B — TCP Byte Counting (shipped 2026-05-06, tag `v0.0.3-phase1b`)
+
+Two fexit programs (`fexit/tcp_sendmsg` + `fexit/tcp_recvmsg`) accumulate per-socket TX/RX bytes into a `BPF_MAP_TYPE_LRU_HASH` keyed by `bpf_get_socket_cookie()`. tsd flushes the map every `--flush-interval-ms` (default 5000 ms) and prints `NetBytes { sock_cookie, pid, tx, rx, last_ns }` lines on stdout. Map is cumulative; LRU eviction at 65k sockets.
+
+**Gate evidence (verified 2026-05-06):**
+- `cargo fmt --check` / `cargo clippy -D warnings` clean
+- `cargo test --workspace` — 13/13 ts-core unit tests pass (9 from Phase 1.A + 4 net_bytes mirrors)
+- `sudo cargo test -p tsd -- --ignored` — three tests pass: `exec_event`, `connect_event`, `bytes_event`
+  - Bytes: `NetBytes { sock_cookie: 0x0000000000000001, pid: 47143, tx: 1024, rx: 0, last_ns: 78939495697541 }` (1024-byte payload reflected exactly)
+- Plan: `docs/superpowers/plans/2026-05-06-phase-1b-tcp-byte-counting.md`
+
+**Known gaps:**
+- UDP byte counting (Phase 2)
+- Cumulative counters; subtraction-on-query lands with DuckDB in Phase 1.D
+- PID is the FIRST observed PID for a socket; sends from softirq context (TCP retransmits) attribute to ksoftirqd
+- IPv6 untested end-to-end (only v4 in `bytes_event.rs`)
+
 ### Phase 1.A — Cgroup Connect Probes (shipped 2026-05-06, tag `v0.0.2-phase1a`)
 
 `bpf/net.bpf.c` adds `cgroup/connect4` + `cgroup/connect6` programs that emit a `TS_NET_CONNECT` ringbuf record (with destination IP+port and protocol) on every outbound connect() syscall system-wide. `tsd` now loads two BPF skeletons (sched_exec + net) and drains both with a single multiplexed ringbuf consumer. Cgroup attachment uses the v2 unified hierarchy at `/sys/fs/cgroup`; v1 hosts are unsupported.
