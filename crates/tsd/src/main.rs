@@ -92,7 +92,10 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
     let payload = &data[std::mem::size_of::<ts_core::TsEventHdr>()..];
 
     let mut cache_mut = cache.borrow_mut();
-    let info = cache_mut.get_or_load(hdr.pid);
+    // Look up by TGID (userspace PID), not kernel PID (which is TID).
+    // Threads in a multithreaded process share TGID; /proc/<TID>/ does
+    // not exist as a top-level dir for non-leader threads.
+    let info = cache_mut.get_or_load(hdr.tgid);
 
     match kind {
         Some(TsEventType::ProcExec) => {
@@ -110,8 +113,9 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
         Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
             Ok(pl) => {
                 println!(
-                    "TsEventHdr {{ kind: NetConnect, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
+                    "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cmdline: {cmdline:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
                     pid = hdr.pid,
+                    tgid = hdr.tgid,
                     comm = info.comm,
                     cmdline = info.display_cmdline(),
                     dst = pl.dst_string(),
