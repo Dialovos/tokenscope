@@ -65,4 +65,35 @@ struct ts_net_connect_payload {
     __u8  _pad[3];
 };
 
+/*
+ * Key for the net_bytes LRU hash map. One entry per TCP socket.
+ * sock_cookie is from bpf_get_socket_cookie() — a stable per-socket id
+ * that survives PID reuse and connection migration within the kernel.
+ *
+ * Layout: 0..8 sock_cookie (u64). Total: 8 bytes.
+ */
+struct ts_net_bytes_key {
+    __u64 sock_cookie;
+};
+
+/*
+ * Value for the net_bytes LRU hash map.
+ *
+ * Layout (natural alignment):
+ *   0..8   tx_bytes  (u64) — cumulative bytes returned from tcp_sendmsg
+ *   8..16  rx_bytes  (u64) — cumulative bytes returned from tcp_recvmsg
+ *   16..24 last_ns   (u64) — last update CLOCK_MONOTONIC ns
+ *   24..28 pid       (u32) — first observed PID; may be ksoftirqd for retransmits
+ *   28..32 _pad      (u32) — reserved
+ *
+ * Total: 32 bytes. Alignment: 8.
+ */
+struct ts_net_bytes_value {
+    __u64 tx_bytes;
+    __u64 rx_bytes;
+    __u64 last_ns;
+    __u32 pid;
+    __u32 _pad;
+};
+
 #endif /* TS_EVENT_H */

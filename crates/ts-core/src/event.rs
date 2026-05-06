@@ -194,6 +194,43 @@ mod tests {
         let err = decode_net_connect(&buf).unwrap_err();
         assert!(matches!(err, DecodeError::Truncated { got: 10, need: 24 }));
     }
+
+    #[test]
+    fn net_bytes_key_size_is_8() {
+        assert_eq!(core::mem::size_of::<TsNetBytesKey>(), 8);
+    }
+
+    #[test]
+    fn net_bytes_value_size_is_32() {
+        assert_eq!(core::mem::size_of::<TsNetBytesValue>(), 32);
+    }
+
+    #[test]
+    fn net_bytes_value_round_trip() {
+        let v = TsNetBytesValue {
+            tx_bytes: 12345,
+            rx_bytes: 67890,
+            last_ns: 0xDEAD_BEEF_CAFE_F00D,
+            pid: 4242,
+            _pad: 0,
+        };
+        let bytes: [u8; 32] = unsafe { core::mem::transmute(v) };
+        let decoded = decode_net_bytes_value(&bytes).unwrap();
+        assert_eq!(decoded.tx_bytes, 12345);
+        assert_eq!(decoded.rx_bytes, 67890);
+        assert_eq!(decoded.last_ns, 0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(decoded.pid, 4242);
+    }
+
+    #[test]
+    fn net_bytes_key_round_trip() {
+        let k = TsNetBytesKey {
+            sock_cookie: 0x1122_3344_5566_7788,
+        };
+        let bytes: [u8; 8] = unsafe { core::mem::transmute(k) };
+        let decoded = decode_net_bytes_key(&bytes).unwrap();
+        assert_eq!(decoded.sock_cookie, 0x1122_3344_5566_7788);
+    }
 }
 
 /// Mirror of `struct ts_net_connect_payload` in `bpf/ts_event.h`.
@@ -249,4 +286,59 @@ pub fn decode_net_connect(payload: &[u8]) -> Result<TsNetConnectPayload, DecodeE
     }
     let pl = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const TsNetConnectPayload) };
     Ok(pl)
+}
+
+/// Mirror of `struct ts_net_bytes_key` in `bpf/ts_event.h`.
+///
+/// Layout: 8 bytes, `sock_cookie: u64`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TsNetBytesKey {
+    pub sock_cookie: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<TsNetBytesKey>() == 8);
+
+/// Mirror of `struct ts_net_bytes_value` in `bpf/ts_event.h`.
+///
+/// Layout (natural alignment):
+/// - 0..8   tx_bytes  (u64)
+/// - 8..16  rx_bytes  (u64)
+/// - 16..24 last_ns   (u64)
+/// - 24..28 pid       (u32)
+/// - 28..32 _pad      (u32)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TsNetBytesValue {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub last_ns: u64,
+    pub pid: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<TsNetBytesValue>() == 32);
+
+/// Decode a key Vec returned from `MapCore::keys()`.
+pub fn decode_net_bytes_key(buf: &[u8]) -> Result<TsNetBytesKey, DecodeError> {
+    let need = core::mem::size_of::<TsNetBytesKey>();
+    if buf.len() < need {
+        return Err(DecodeError::Truncated {
+            got: buf.len(),
+            need,
+        });
+    }
+    Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const TsNetBytesKey) })
+}
+
+/// Decode a value Vec returned from `MapCore::lookup()`.
+pub fn decode_net_bytes_value(buf: &[u8]) -> Result<TsNetBytesValue, DecodeError> {
+    let need = core::mem::size_of::<TsNetBytesValue>();
+    if buf.len() < need {
+        return Err(DecodeError::Truncated {
+            got: buf.len(),
+            need,
+        });
+    }
+    Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const TsNetBytesValue) })
 }

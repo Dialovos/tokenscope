@@ -7,5 +7,6 @@
 pub mod event;
 
 pub use event::{
-    decode_header, decode_net_connect, DecodeError, TsEventHdr, TsEventType, TsNetConnectPayload,
+    decode_header, decode_net_bytes_key, decode_net_bytes_value, decode_net_connect, DecodeError,
+    TsEventHdr, TsEventType, TsNetBytesKey, TsNetBytesValue, TsNetConnectPayload,
 };
