@@ -154,4 +154,99 @@ mod tests {
     fn unknown_event_type_is_none() {
         assert_eq!(TsEventType::from_u16(255), None);
     }
+
+    #[test]
+    fn net_connect_payload_size_is_24() {
+        assert_eq!(core::mem::size_of::<TsNetConnectPayload>(), 24);
+    }
+
+    #[test]
+    fn net_connect_v4_round_trip() {
+        let pl = TsNetConnectPayload {
+            dst_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4],
+            dst_port: 443,
+            family: 2,
+            protocol: 6,
+            _pad: [0; 3],
+        };
+        let bytes: [u8; 24] = unsafe { core::mem::transmute(pl) };
+        let decoded = decode_net_connect(&bytes).unwrap();
+        assert_eq!(decoded.dst_string(), "1.2.3.4:443");
+    }
+
+    #[test]
+    fn net_connect_v6_round_trip() {
+        let pl = TsNetConnectPayload {
+            dst_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            dst_port: 80,
+            family: 10,
+            protocol: 6,
+            _pad: [0; 3],
+        };
+        let bytes: [u8; 24] = unsafe { core::mem::transmute(pl) };
+        let decoded = decode_net_connect(&bytes).unwrap();
+        assert_eq!(decoded.dst_string(), "[::1]:80");
+    }
+
+    #[test]
+    fn net_connect_truncated() {
+        let buf = [0u8; 10];
+        let err = decode_net_connect(&buf).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated { got: 10, need: 24 }));
+    }
+}
+
+/// Mirror of `struct ts_net_connect_payload` in `bpf/ts_event.h`.
+///
+/// Layout:
+/// - 0..16  dst_addr  (16 bytes; IPv4 in last 4 for AF_INET, full IPv6 for AF_INET6)
+/// - 16..18 dst_port  (u16, host byte order)
+/// - 18..20 family    (u16: 2=AF_INET, 10=AF_INET6)
+/// - 20..21 protocol  (u8)
+/// - 21..24 _pad
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TsNetConnectPayload {
+    pub dst_addr: [u8; 16],
+    pub dst_port: u16,
+    pub family: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<TsNetConnectPayload>() == 24);
+
+impl TsNetConnectPayload {
+    /// Render the destination as a string (`"1.2.3.4:443"` / `"[::1]:80"`).
+    pub fn dst_string(&self) -> String {
+        match self.family {
+            2 => {
+                let ip = std::net::Ipv4Addr::new(
+                    self.dst_addr[12],
+                    self.dst_addr[13],
+                    self.dst_addr[14],
+                    self.dst_addr[15],
+                );
+                format!("{ip}:{}", self.dst_port)
+            }
+            10 => {
+                let ip = std::net::Ipv6Addr::from(self.dst_addr);
+                format!("[{ip}]:{}", self.dst_port)
+            }
+            other => format!("af{other}/{:?}:{}", &self.dst_addr[..], self.dst_port),
+        }
+    }
+}
+
+/// Decode a TS_NET_CONNECT payload (caller passes the slice AFTER the header).
+pub fn decode_net_connect(payload: &[u8]) -> Result<TsNetConnectPayload, DecodeError> {
+    let need = core::mem::size_of::<TsNetConnectPayload>();
+    if payload.len() < need {
+        return Err(DecodeError::Truncated {
+            got: payload.len(),
+            need,
+        });
+    }
+    let pl = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const TsNetConnectPayload) };
+    Ok(pl)
 }
