@@ -35,13 +35,13 @@ enum ts_event_type {
 struct ts_event_hdr {
     __u64 ts_ns;       /* CLOCK_MONOTONIC, kernel time */
     __u32 cpu;
-    __u32 pid;         /* userspace PID == kernel TGID */
-    __u32 tgid;        /* kernel TGID == thread group leader */
+    __u32 pid;         /* kernel PID (TID in userspace) */
+    __u32 tgid;        /* kernel TGID (== userspace PID) */
     /* 4-byte implicit padding for 8-byte align of cgroup_id */
     __u64 cgroup_id;
     __u16 type;        /* enum ts_event_type */
     __u16 len;         /* payload bytes following the header */
-    /* 4-byte implicit tail padding to align struct size to 8 */
+    char  comm[16];    /* bpf_get_current_comm() at event emit time, NUL-padded */
 };
 
 /*
@@ -80,13 +80,14 @@ struct ts_net_bytes_key {
  * Value for the net_bytes LRU hash map.
  *
  * Layout (natural alignment):
- *   0..8   tx_bytes  (u64) — cumulative bytes returned from tcp_sendmsg
- *   8..16  rx_bytes  (u64) — cumulative bytes returned from tcp_recvmsg
- *   16..24 last_ns   (u64) — last update CLOCK_MONOTONIC ns
- *   24..28 pid       (u32) — first observed PID; may be ksoftirqd for retransmits
- *   28..32 _pad      (u32) — reserved
+ *   0..8   tx_bytes  (u64)
+ *   8..16  rx_bytes  (u64)
+ *   16..24 last_ns   (u64)
+ *   24..28 pid       (u32) — first observed userspace PID (TGID)
+ *   28..32 _pad      (u32)
+ *   32..48 comm      (char[16]) — bpf_get_current_comm at first observation
  *
- * Total: 32 bytes. Alignment: 8.
+ * Total: 48 bytes. Alignment: 8.
  */
 struct ts_net_bytes_value {
     __u64 tx_bytes;
@@ -94,6 +95,7 @@ struct ts_net_bytes_value {
     __u64 last_ns;
     __u32 pid;
     __u32 _pad;
+    char  comm[16];
 };
 
 #endif /* TS_EVENT_H */

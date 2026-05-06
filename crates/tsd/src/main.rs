@@ -91,19 +91,20 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
     let kind = TsEventType::from_u16(hdr.ty);
     let payload = &data[std::mem::size_of::<ts_core::TsEventHdr>()..];
 
-    let mut cache_mut = cache.borrow_mut();
-    // Look up by TGID (userspace PID), not kernel PID (which is TID).
-    // Threads in a multithreaded process share TGID; /proc/<TID>/ does
-    // not exist as a top-level dir for non-leader threads.
-    let info = cache_mut.get_or_load(hdr.tgid);
+    // Comm comes from the event payload (BPF captured it at event time)
+    // — no /proc race. Cache is consulted only for cmdline (best-effort,
+    // may show "[<gone>]" for short-lived processes).
+    let comm = hdr.comm_str();
+    let cmdline = {
+        let mut cache_mut = cache.borrow_mut();
+        cache_mut.get_or_load(hdr.tgid).display_cmdline()
+    };
 
     match kind {
         Some(TsEventType::ProcExec) => {
             println!(
-                "TsEventHdr {{ kind: ProcExec, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts} }}",
+                "TsEventHdr {{ kind: ProcExec, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cmdline: {cmdline:?}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts} }}",
                 pid = hdr.pid,
-                comm = info.comm,
-                cmdline = info.display_cmdline(),
                 tgid = hdr.tgid,
                 cpu = hdr.cpu,
                 cgid = hdr.cgroup_id,
@@ -116,8 +117,6 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
                     "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cmdline: {cmdline:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
                     pid = hdr.pid,
                     tgid = hdr.tgid,
-                    comm = info.comm,
-                    cmdline = info.display_cmdline(),
                     dst = pl.dst_string(),
                     proto = pl.protocol,
                     cgid = hdr.cgroup_id,
@@ -129,7 +128,6 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
             println!(
                 "TsEventHdr {{ kind: {other:?}, pid: {pid}, comm: {comm:?}, len: {len} }}",
                 pid = hdr.pid,
-                comm = info.comm,
                 len = hdr.len,
             );
         }
@@ -138,7 +136,6 @@ fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
                 "TsEventHdr {{ kind: Unknown({ty}), pid: {pid}, comm: {comm:?}, len: {len} }}",
                 ty = hdr.ty,
                 pid = hdr.pid,
-                comm = info.comm,
                 len = hdr.len,
             );
         }

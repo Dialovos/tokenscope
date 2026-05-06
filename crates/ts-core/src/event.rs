@@ -49,15 +49,16 @@ impl TsEventType {
 /// Layout (natural alignment, no `packed`):
 /// - 0..8   ts_ns      (u64)
 /// - 8..12  cpu        (u32)
-/// - 12..16 pid        (u32)
-/// - 16..20 tgid       (u32)
-/// - 20..24 _pad       (u32, padding to 8-byte align cgroup_id)
+/// - 12..16 pid        (u32)  — kernel PID == userspace TID
+/// - 16..20 tgid       (u32)  — kernel TGID == userspace PID
+/// - 20..24 _pad       (u32)  — padding to 8-byte align cgroup_id
 /// - 24..32 cgroup_id  (u64)
 /// - 32..34 ty         (u16)
 /// - 34..36 len        (u16)
-/// - 36..40 _tail_pad  (u32, padding to round struct size up to 8-byte align)
+/// - 36..52 comm       (char[16]) — bpf_get_current_comm at emit time, NUL-padded
+/// - 52..56 _tail_pad  (u32)  — padding to round struct size up to 8-byte align
 ///
-/// Total size: 40 bytes. Alignment: 8.
+/// Total size: 56 bytes. Alignment: 8.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TsEventHdr {
@@ -68,10 +69,24 @@ pub struct TsEventHdr {
     pub cgroup_id: u64,
     pub ty: u16,
     pub len: u16,
+    pub comm: [u8; 16],
 }
 
-const _: () = assert!(size_of::<TsEventHdr>() == 40);
+const _: () = assert!(size_of::<TsEventHdr>() == 56);
 const _: () = assert!(align_of::<TsEventHdr>() == 8);
+
+impl TsEventHdr {
+    /// Decode the NUL-padded `comm` field as a UTF-8 string. Stops at
+    /// the first NUL byte; non-UTF-8 bytes become replacement chars.
+    pub fn comm_str(&self) -> String {
+        let end = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        String::from_utf8_lossy(&self.comm[..end]).into_owned()
+    }
+}
 
 /// Errors that can happen while decoding a ringbuf record.
 #[derive(Debug, thiserror::Error)]
@@ -108,8 +123,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_size_is_forty() {
-        assert_eq!(size_of::<TsEventHdr>(), 40);
+    fn header_size_is_56() {
+        assert_eq!(size_of::<TsEventHdr>(), 56);
     }
 
     #[test]
@@ -121,11 +136,13 @@ mod tests {
     fn decode_truncated() {
         let buf = [0u8; 10];
         let err = decode_header(&buf).unwrap_err();
-        assert!(matches!(err, DecodeError::Truncated { got: 10, need: 40 }));
+        assert!(matches!(err, DecodeError::Truncated { got: 10, need: 56 }));
     }
 
     #[test]
     fn decode_round_trip() {
+        let mut comm = [0u8; 16];
+        comm[..5].copy_from_slice(b"sleep");
         let original = TsEventHdr {
             ts_ns: 0xDEAD_BEEF_CAFE_F00D,
             cpu: 3,
@@ -134,8 +151,9 @@ mod tests {
             cgroup_id: 0x4242_4242_4242_4242,
             ty: TsEventType::ProcExec as u16,
             len: 0,
+            comm,
         };
-        let bytes: [u8; 40] = unsafe { core::mem::transmute(original) };
+        let bytes: [u8; 56] = unsafe { core::mem::transmute(original) };
         let decoded = decode_header(&bytes).unwrap();
         assert_eq!(decoded.ts_ns, original.ts_ns);
         assert_eq!(decoded.cpu, original.cpu);
@@ -144,6 +162,7 @@ mod tests {
         assert_eq!(decoded.cgroup_id, original.cgroup_id);
         assert_eq!(decoded.ty, original.ty);
         assert_eq!(decoded.len, original.len);
+        assert_eq!(decoded.comm_str(), "sleep");
         assert_eq!(
             TsEventType::from_u16(decoded.ty),
             Some(TsEventType::ProcExec)
@@ -201,25 +220,29 @@ mod tests {
     }
 
     #[test]
-    fn net_bytes_value_size_is_32() {
-        assert_eq!(core::mem::size_of::<TsNetBytesValue>(), 32);
+    fn net_bytes_value_size_is_48() {
+        assert_eq!(core::mem::size_of::<TsNetBytesValue>(), 48);
     }
 
     #[test]
     fn net_bytes_value_round_trip() {
+        let mut comm = [0u8; 16];
+        comm[..4].copy_from_slice(b"curl");
         let v = TsNetBytesValue {
             tx_bytes: 12345,
             rx_bytes: 67890,
             last_ns: 0xDEAD_BEEF_CAFE_F00D,
             pid: 4242,
             _pad: 0,
+            comm,
         };
-        let bytes: [u8; 32] = unsafe { core::mem::transmute(v) };
+        let bytes: [u8; 48] = unsafe { core::mem::transmute(v) };
         let decoded = decode_net_bytes_value(&bytes).unwrap();
         assert_eq!(decoded.tx_bytes, 12345);
         assert_eq!(decoded.rx_bytes, 67890);
         assert_eq!(decoded.last_ns, 0xDEAD_BEEF_CAFE_F00D);
         assert_eq!(decoded.pid, 4242);
+        assert_eq!(decoded.comm_str(), "curl");
     }
 
     #[test]
@@ -307,6 +330,7 @@ const _: () = assert!(core::mem::size_of::<TsNetBytesKey>() == 8);
 /// - 16..24 last_ns   (u64)
 /// - 24..28 pid       (u32)
 /// - 28..32 _pad      (u32)
+/// - 32..48 comm      (char[16]) — bpf_get_current_comm at first observation
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TsNetBytesValue {
@@ -315,9 +339,22 @@ pub struct TsNetBytesValue {
     pub last_ns: u64,
     pub pid: u32,
     pub _pad: u32,
+    pub comm: [u8; 16],
 }
 
-const _: () = assert!(core::mem::size_of::<TsNetBytesValue>() == 32);
+const _: () = assert!(core::mem::size_of::<TsNetBytesValue>() == 48);
+
+impl TsNetBytesValue {
+    /// Decode the NUL-padded `comm` field as a UTF-8 string.
+    pub fn comm_str(&self) -> String {
+        let end = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        String::from_utf8_lossy(&self.comm[..end]).into_owned()
+    }
+}
 
 /// Decode a key Vec returned from `MapCore::keys()`.
 pub fn decode_net_bytes_key(buf: &[u8]) -> Result<TsNetBytesKey, DecodeError> {

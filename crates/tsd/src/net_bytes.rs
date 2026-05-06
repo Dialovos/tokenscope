@@ -30,13 +30,14 @@ pub fn flush(map: &MapMut<'_>, cache: &RefCell<ProcessCache>) {
         if value.tx_bytes == 0 && value.rx_bytes == 0 {
             continue;
         }
-        let info = cache_mut.get_or_load(value.pid);
+        // comm captured by BPF at first observation — not subject to
+        // the /proc race. cmdline is best-effort (may be "[<gone>]").
+        let cmdline = cache_mut.get_or_load(value.pid).display_cmdline();
         println!(
             "NetBytes {{ sock_cookie: {cookie:#018x}, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, tx: {tx}, rx: {rx}, last_ns: {ns} }}",
             cookie = key.sock_cookie,
             pid = value.pid,
-            comm = info.comm,
-            cmdline = info.display_cmdline(),
+            comm = value.comm_str(),
             tx = value.tx_bytes,
             rx = value.rx_bytes,
             ns = value.last_ns,

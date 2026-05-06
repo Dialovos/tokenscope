@@ -63,6 +63,7 @@ static __always_inline int emit_connect(struct bpf_sock_addr *ctx, __u16 family)
     r->hdr.cgroup_id = bpf_get_current_cgroup_id();
     r->hdr.type      = TS_NET_CONNECT;
     r->hdr.len       = sizeof(struct ts_net_connect_payload);
+    bpf_get_current_comm(&r->hdr.comm, sizeof(r->hdr.comm));
 
     /* user_port is __be16 in network byte order; convert. */
     r->pl.dst_port = bpf_ntohs(ctx->user_port);
@@ -136,6 +137,7 @@ static __always_inline void bump_bytes(__u64 cookie, __s32 bytes, int rx)
             .pid      = (__u32)(bpf_get_current_pid_tgid() >> 32),
             ._pad     = 0,
         };
+        bpf_get_current_comm(&nv.comm, sizeof(nv.comm));
         bpf_map_update_elem(&net_bytes, &k, &nv, BPF_NOEXIST);
     }
 }

@@ -52,6 +52,7 @@ int handle_exec(void *ctx)
     e->cgroup_id = bpf_get_current_cgroup_id();
     e->type      = TS_PROC_EXEC;
     e->len       = 0;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
     bpf_ringbuf_submit(e, 0);
     return 0;
