@@ -26,6 +26,19 @@ struct {
 } events SEC(".maps");
 
 /*
+ * Per-socket TX/RX accumulator. Keyed by socket cookie (stable across
+ * PID reuse). Cleared via LRU eviction at 65k entries — sufficient for
+ * any realistic single-host workload. Userspace iterates this map on a
+ * timer to surface counts.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct ts_net_bytes_key);
+    __type(value, struct ts_net_bytes_value);
+} net_bytes SEC(".maps");
+
+/*
  * Combined header + payload reserved as one record for atomic delivery.
  */
 struct net_connect_record {
@@ -92,4 +105,68 @@ SEC("cgroup/connect6")
 int handle_connect6(struct bpf_sock_addr *ctx)
 {
     return emit_connect(ctx, AF_INET6);
+}
+
+/*
+ * Atomically bump tx_bytes (rx==0) or rx_bytes (rx==1) for the given
+ * socket cookie. Inserts a new entry on first observation; updates
+ * last_ns and (only on insert) pid.
+ */
+static __always_inline void bump_bytes(__u64 cookie, __s32 bytes, int rx)
+{
+    if (bytes <= 0)
+        return;
+
+    struct ts_net_bytes_key k = { .sock_cookie = cookie };
+    struct ts_net_bytes_value *v = bpf_map_lookup_elem(&net_bytes, &k);
+
+    __u64 now_ns = bpf_ktime_get_ns();
+
+    if (v) {
+        if (rx)
+            __sync_fetch_and_add(&v->rx_bytes, (__u64)bytes);
+        else
+            __sync_fetch_and_add(&v->tx_bytes, (__u64)bytes);
+        v->last_ns = now_ns;
+    } else {
+        struct ts_net_bytes_value nv = {
+            .tx_bytes = rx ? 0 : (__u64)bytes,
+            .rx_bytes = rx ? (__u64)bytes : 0,
+            .last_ns  = now_ns,
+            .pid      = (__u32)(bpf_get_current_pid_tgid() >> 32),
+            ._pad     = 0,
+        };
+        bpf_map_update_elem(&net_bytes, &k, &nv, BPF_NOEXIST);
+    }
+}
+
+/*
+ * fexit/tcp_sendmsg: fires on tcp_sendmsg return.
+ * Kernel signature: int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+ */
+SEC("fexit/tcp_sendmsg")
+int BPF_PROG(handle_sendmsg, struct sock *sk, struct msghdr *msg, size_t size, int ret)
+{
+    if (ret <= 0)
+        return 0;
+    __u64 cookie = bpf_get_socket_cookie(sk);
+    bump_bytes(cookie, ret, 0 /* tx */);
+    return 0;
+}
+
+/*
+ * fexit/tcp_recvmsg.
+ * Kernel signature (5.19+):
+ *   int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ *                   int flags, int *addr_len)
+ */
+SEC("fexit/tcp_recvmsg")
+int BPF_PROG(handle_recvmsg, struct sock *sk, struct msghdr *msg, size_t len,
+             int flags, int *addr_len, int ret)
+{
+    if (ret <= 0)
+        return 0;
+    __u64 cookie = bpf_get_socket_cookie(sk);
+    bump_bytes(cookie, ret, 1 /* rx */);
+    return 0;
 }
