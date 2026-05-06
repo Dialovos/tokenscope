@@ -46,10 +46,7 @@ pub struct LoadedSkels<'obj> {
 }
 
 /// Load and attach every Phase 1.A BPF program.
-pub fn load_all<'obj>(
-    storage: &'obj mut SkelStorage,
-    cgroup_root: File,
-) -> Result<LoadedSkels<'obj>> {
+pub fn load_all(storage: &mut SkelStorage, cgroup_root: File) -> Result<LoadedSkels<'_>> {
     let mut sched = SchedExecSkelBuilder::default()
         .open(&mut storage.sched)
         .context("open sched_exec skeleton")?
