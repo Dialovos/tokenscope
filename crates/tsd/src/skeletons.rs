@@ -36,12 +36,13 @@ impl Default for SkelStorage {
     }
 }
 
-/// Loaded + attached skeletons. The `_cgroup_links` field keeps the
-/// cgroup BPF attachments alive (dropping them detaches the program).
+/// Loaded + attached skeletons. The `_cgroup_links` and `_fexit_links`
+/// fields keep the BPF attachments alive (dropping them detaches).
 pub struct LoadedSkels<'obj> {
     pub sched: SchedExecSkel<'obj>,
     pub net: NetSkel<'obj>,
     _cgroup_links: Vec<Link>,
+    _fexit_links: Vec<Link>,
     _cgroup_root: File,
 }
 
@@ -72,10 +73,22 @@ pub fn load_all(storage: &mut SkelStorage, cgroup_root: File) -> Result<LoadedSk
         .attach_cgroup(cgroup_fd)
         .map_err(|e| anyhow!("attach cgroup/connect6: {e}"))?;
 
+    let send_link = net
+        .progs
+        .handle_sendmsg
+        .attach()
+        .map_err(|e| anyhow!("attach fexit/tcp_sendmsg: {e}"))?;
+    let recv_link = net
+        .progs
+        .handle_recvmsg
+        .attach()
+        .map_err(|e| anyhow!("attach fexit/tcp_recvmsg: {e}"))?;
+
     Ok(LoadedSkels {
         sched,
         net,
         _cgroup_links: vec![link4, link6],
+        _fexit_links: vec![send_link, recv_link],
         _cgroup_root: cgroup_root,
     })
 }

@@ -1,13 +1,15 @@
-//! TokenScope daemon (Phase 1.A).
+//! TokenScope daemon (Phase 1.B).
 //!
-//! Loads two BPF skeletons (sched_exec + net), drains both maps via a
-//! single RingBuffer (libbpf-rs multiplexes), and prints decoded events
-//! on stdout. Phase 1.D will replace stdout with the DuckDB sink.
+//! Loads two BPF skeletons (sched_exec + net), drains both ringbufs,
+//! and on a configurable cadence prints accumulated TCP byte counts
+//! from the `net_bytes` LRU map. Phase 1.D replaces stdout with the
+//! DuckDB sink.
 
 mod cgroup;
+mod net_bytes;
 mod skeletons;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -25,6 +27,10 @@ struct Args {
     /// RUST_LOG-style filter for tracing.
     #[arg(long, default_value = "info")]
     log_filter: String,
+
+    /// How often to scan + print the per-socket byte counter map (milliseconds).
+    #[arg(long, default_value_t = 5000)]
+    flush_interval_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -36,13 +42,13 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("tsd starting (Phase 1.A — sched_exec + cgroup/connect)");
+    info!("tsd starting (Phase 1.B — sched_exec + cgroup/connect + tcp byte counting)");
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
     let mut storage = SkelStorage::new();
     let skels = load_all(&mut storage, cgroup_root).context("load skeletons")?;
 
-    info!("BPF programs attached — sched_exec + cgroup/connect{{4,6}}");
+    info!(flush_ms = args.flush_interval_ms, "BPF programs attached");
 
     let mut builder = RingBufferBuilder::new();
     builder
@@ -53,9 +59,16 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
 
+    let flush_interval = Duration::from_millis(args.flush_interval_ms);
+    let mut last_flush = Instant::now();
+
     loop {
         if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
             error!(?e, "ringbuf poll error");
+        }
+        if last_flush.elapsed() >= flush_interval {
+            net_bytes::flush(&skels.net.maps.net_bytes);
+            last_flush = Instant::now();
         }
     }
 }
