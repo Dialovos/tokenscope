@@ -1,10 +1,12 @@
-//! TokenScope daemon (Phase 0).
+//! TokenScope daemon (Phase 1.A).
 //!
-//! Loads the `sched_exec` BPF program, attaches its tracepoint, drains
-//! the ringbuf, and prints each event as a debug line on stdout. Phase 1
-//! replaces stdout with the in-process pipeline.
+//! Loads two BPF skeletons (sched_exec + net), drains both maps via a
+//! single RingBuffer (libbpf-rs multiplexes), and prints decoded events
+//! on stdout. Phase 1.D will replace stdout with the DuckDB sink.
 
-use std::mem::MaybeUninit;
+mod cgroup;
+mod skeletons;
+
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -12,10 +14,10 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use ts_bpf_sys::libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use ts_bpf_sys::libbpf_rs::{OpenObject, RingBufferBuilder};
-use ts_bpf_sys::sched_exec::SchedExecSkelBuilder;
-use ts_core::{decode_header, TsEventType};
+use ts_bpf_sys::libbpf_rs::RingBufferBuilder;
+use ts_core::{decode_header, decode_net_connect, TsEventType};
+
+use crate::skeletons::{load_all, SkelStorage};
 
 #[derive(Parser, Debug)]
 #[command(name = "tsd", version, about = "TokenScope daemon")]
@@ -34,45 +36,46 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("tsd starting (Phase 0 — sched_exec only)");
+    info!("tsd starting (Phase 1.A — sched_exec + cgroup/connect)");
 
-    let skel_builder = SchedExecSkelBuilder::default();
-    let mut open_object: MaybeUninit<OpenObject> = MaybeUninit::uninit();
-    let open_skel = skel_builder
-        .open(&mut open_object)
-        .context("open BPF skeleton")?;
-    let mut skel = open_skel.load().context("load BPF skeleton (verifier)")?;
-    skel.attach().context("attach BPF programs")?;
+    let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
+    let mut storage = SkelStorage::new();
+    let skels = load_all(&mut storage, cgroup_root).context("load skeletons")?;
 
-    info!("BPF program attached — listening for sched_process_exec");
+    info!("BPF programs attached — sched_exec + cgroup/connect{{4,6}}");
 
     let mut builder = RingBufferBuilder::new();
     builder
-        .add(&skel.maps.events, handle_event)
-        .map_err(|e| anyhow!("add ringbuf consumer: {e}"))?;
+        .add(&skels.sched.maps.events, handle_event)
+        .map_err(|e| anyhow!("add sched ringbuf: {e}"))?;
+    builder
+        .add(&skels.net.maps.events, handle_event)
+        .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
 
     loop {
-        match ringbuf.poll(Duration::from_millis(200)) {
-            Ok(_) => {}
-            Err(e) => {
-                error!(?e, "ringbuf poll error");
-            }
+        if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
+            error!(?e, "ringbuf poll error");
         }
     }
 }
 
-/// Called by libbpf-rs for each ringbuf record. Returns 0 to keep
-/// consuming; non-zero would stop the ringbuf entirely.
 fn handle_event(data: &[u8]) -> i32 {
-    match decode_header(data) {
-        Ok(hdr) => {
-            let kind = TsEventType::from_u16(hdr.ty)
-                .map(|t| format!("{t:?}"))
-                .unwrap_or_else(|| format!("Unknown({})", hdr.ty));
+    let hdr = match decode_header(data) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(?e, len = data.len(), "decode header failed");
+            return 0;
+        }
+    };
+
+    let kind = TsEventType::from_u16(hdr.ty);
+    let payload = &data[std::mem::size_of::<ts_core::TsEventHdr>()..];
+
+    match kind {
+        Some(TsEventType::ProcExec) => {
             println!(
-                "TsEventHdr {{ kind: {kind}, pid: {pid}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts}, len: {len} }}",
-                kind = kind,
+                "TsEventHdr {{ kind: ProcExec, pid: {pid}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts}, len: {len} }}",
                 pid = hdr.pid,
                 tgid = hdr.tgid,
                 cpu = hdr.cpu,
@@ -80,11 +83,36 @@ fn handle_event(data: &[u8]) -> i32 {
                 ts = hdr.ts_ns,
                 len = hdr.len,
             );
-            0
         }
-        Err(e) => {
-            error!(?e, len = data.len(), "failed to decode ringbuf event");
-            0
+        Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
+            Ok(pl) => {
+                println!(
+                    "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, dst: {dst}, proto: {proto} }}",
+                    pid = hdr.pid,
+                    tgid = hdr.tgid,
+                    cpu = hdr.cpu,
+                    cgid = hdr.cgroup_id,
+                    dst = pl.dst_string(),
+                    proto = pl.protocol,
+                );
+            }
+            Err(e) => error!(?e, "decode net_connect failed"),
+        },
+        Some(other) => {
+            println!(
+                "TsEventHdr {{ kind: {other:?}, pid: {pid}, len: {len} }}",
+                pid = hdr.pid,
+                len = hdr.len,
+            );
+        }
+        None => {
+            println!(
+                "TsEventHdr {{ kind: Unknown({ty}), pid: {pid}, len: {len} }}",
+                ty = hdr.ty,
+                pid = hdr.pid,
+                len = hdr.len,
+            );
         }
     }
+    0
 }
