@@ -24,6 +24,27 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.A — Cgroup Connect Probes (shipped 2026-05-06, tag `v0.0.2-phase1a`)
+
+`bpf/net.bpf.c` adds `cgroup/connect4` + `cgroup/connect6` programs that emit a `TS_NET_CONNECT` ringbuf record (with destination IP+port and protocol) on every outbound connect() syscall system-wide. `tsd` now loads two BPF skeletons (sched_exec + net) and drains both with a single multiplexed ringbuf consumer. Cgroup attachment uses the v2 unified hierarchy at `/sys/fs/cgroup`; v1 hosts are unsupported.
+
+**Gate evidence (verified 2026-05-06):**
+- `cargo fmt --check` / `cargo clippy -D warnings` clean
+- `cargo test --workspace` — 9/9 ts-core unit tests pass (5 from Phase 0 + 4 net_connect)
+- `sudo cargo test -p tsd -- --ignored` — both `captures_exec_event_for_child` and `captures_cgroup_connect_v4` pass
+  - Connect: `TsEventHdr { kind: NetConnect, pid: 41815, tgid: 41814, cpu: 16, cgroup_id: 0x15, dst: 127.0.0.1:1, proto: 6 }`
+  - Exec: `TsEventHdr { kind: ProcExec, pid: 41820, tgid: 41820, cpu: 18, cgroup_id: 0x15, ts_ns: 77551326289437, len: 0 }`
+- Plan: `docs/superpowers/plans/2026-05-02-phase-1a-cgroup-connect.md`
+
+**Verifier gotcha hit:** `__builtin_memcpy(dst, ctx->user_ip6, 16)` was rejected because clang compiled it to a u64 load via modified ctx pointer. Reading each `user_ip6[i]` as a u32 individually fixed it. Pattern noted in `bpf/net.bpf.c` for future probes touching `bpf_sock_addr`.
+
+**Known gaps left for later phases:**
+- TCP byte counting via tcp_sendmsg/tcp_recvmsg (Phase 1.B)
+- Process enrichment (cmdline, exe, /proc walk) (Phase 1.C)
+- DuckDB persistence (Phase 1.D)
+- `tsctl tail` / `tsctl status` (Phase 1.E)
+- IPv6 tested only at compile/load time; no end-to-end v6 integration test
+
 ### Phase 0 — Foundations (shipped 2026-05-02, tag `v0.0.1-phase0`)
 
 Workspace scaffold (`ts-core`, `ts-bpf-sys`, `tsd`, `tsctl`, `tstop`); libbpf-cargo skeleton build pipeline; `bpf/sched_exec.bpf.c` tracepoint emitting `TsEventHdr` records through a 256 KiB ringbuf; `tsd` drains and prints them; GitHub Actions CI on Ubuntu 22.04 + 24.04.
