@@ -1,16 +1,17 @@
-//! TokenScope daemon (Phase 1.B).
+//! TokenScope daemon (Phase 1.C).
 //!
-//! Loads two BPF skeletons (sched_exec + net), drains both ringbufs,
-//! and on a configurable cadence prints accumulated TCP byte counts
-//! from the `net_bytes` LRU map. Phase 1.D replaces stdout with the
-//! DuckDB sink.
+//! Adds a `proc_cache` that resolves pid → (comm, cmdline) lazily from
+//! /proc. Both the ringbuf event handler and the periodic net_bytes
+//! flush borrow the cache via closures. Single-threaded throughout —
+//! `RefCell` is correct because the main loop polls and flushes
+//! serially.
 
 mod cgroup;
 mod net_bytes;
-#[allow(dead_code)]
 mod proc_cache;
 mod skeletons;
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 use ts_bpf_sys::libbpf_rs::RingBufferBuilder;
 use ts_core::{decode_header, decode_net_connect, TsEventType};
 
+use crate::proc_cache::ProcessCache;
 use crate::skeletons::{load_all, SkelStorage};
 
 #[derive(Parser, Debug)]
@@ -44,7 +46,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("tsd starting (Phase 1.B — sched_exec + cgroup/connect + tcp byte counting)");
+    info!("tsd starting (Phase 1.C — sched_exec + cgroup/connect + tcp bytes + /proc enrichment)");
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
     let mut storage = SkelStorage::new();
@@ -52,12 +54,14 @@ fn main() -> Result<()> {
 
     info!(flush_ms = args.flush_interval_ms, "BPF programs attached");
 
+    let cache = RefCell::new(ProcessCache::new());
+
     let mut builder = RingBufferBuilder::new();
     builder
-        .add(&skels.sched.maps.events, handle_event)
+        .add(&skels.sched.maps.events, |data| handle_event(data, &cache))
         .map_err(|e| anyhow!("add sched ringbuf: {e}"))?;
     builder
-        .add(&skels.net.maps.events, handle_event)
+        .add(&skels.net.maps.events, |data| handle_event(data, &cache))
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
 
@@ -69,13 +73,13 @@ fn main() -> Result<()> {
             error!(?e, "ringbuf poll error");
         }
         if last_flush.elapsed() >= flush_interval {
-            net_bytes::flush(&skels.net.maps.net_bytes);
+            net_bytes::flush(&skels.net.maps.net_bytes, &cache);
             last_flush = Instant::now();
         }
     }
 }
 
-fn handle_event(data: &[u8]) -> i32 {
+fn handle_event(data: &[u8], cache: &RefCell<ProcessCache>) -> i32 {
     let hdr = match decode_header(data) {
         Ok(h) => h,
         Err(e) => {
@@ -87,44 +91,50 @@ fn handle_event(data: &[u8]) -> i32 {
     let kind = TsEventType::from_u16(hdr.ty);
     let payload = &data[std::mem::size_of::<ts_core::TsEventHdr>()..];
 
+    let mut cache_mut = cache.borrow_mut();
+    let info = cache_mut.get_or_load(hdr.pid);
+
     match kind {
         Some(TsEventType::ProcExec) => {
             println!(
-                "TsEventHdr {{ kind: ProcExec, pid: {pid}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts}, len: {len} }}",
+                "TsEventHdr {{ kind: ProcExec, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts} }}",
                 pid = hdr.pid,
+                comm = info.comm,
+                cmdline = info.display_cmdline(),
                 tgid = hdr.tgid,
                 cpu = hdr.cpu,
                 cgid = hdr.cgroup_id,
                 ts = hdr.ts_ns,
-                len = hdr.len,
             );
         }
         Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
             Ok(pl) => {
                 println!(
-                    "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, cpu: {cpu}, cgroup_id: {cgid:#x}, dst: {dst}, proto: {proto} }}",
+                    "TsEventHdr {{ kind: NetConnect, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
                     pid = hdr.pid,
-                    tgid = hdr.tgid,
-                    cpu = hdr.cpu,
-                    cgid = hdr.cgroup_id,
+                    comm = info.comm,
+                    cmdline = info.display_cmdline(),
                     dst = pl.dst_string(),
                     proto = pl.protocol,
+                    cgid = hdr.cgroup_id,
                 );
             }
             Err(e) => error!(?e, "decode net_connect failed"),
         },
         Some(other) => {
             println!(
-                "TsEventHdr {{ kind: {other:?}, pid: {pid}, len: {len} }}",
+                "TsEventHdr {{ kind: {other:?}, pid: {pid}, comm: {comm:?}, len: {len} }}",
                 pid = hdr.pid,
+                comm = info.comm,
                 len = hdr.len,
             );
         }
         None => {
             println!(
-                "TsEventHdr {{ kind: Unknown({ty}), pid: {pid}, len: {len} }}",
+                "TsEventHdr {{ kind: Unknown({ty}), pid: {pid}, comm: {comm:?}, len: {len} }}",
                 ty = hdr.ty,
                 pid = hdr.pid,
+                comm = info.comm,
                 len = hdr.len,
             );
         }

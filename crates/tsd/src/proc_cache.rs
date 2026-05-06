@@ -68,14 +68,6 @@ impl ProcessCache {
         self.order.push_back(pid);
         self.map.insert(pid, info);
     }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
 }
 
 impl Default for ProcessCache {
@@ -125,7 +117,7 @@ mod tests {
 
     #[test]
     fn parse_cmdline_no_trailing_nul() {
-        let bytes = b"sleep\01";
+        let bytes = b"sleep\x001";
         assert_eq!(parse_cmdline(bytes), "sleep 1");
     }
 
@@ -173,7 +165,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(c.len(), CAPACITY);
+        assert_eq!(c.map.len(), CAPACITY);
         for pid in 1..=10 {
             assert!(!c.map.contains_key(&pid));
         }
