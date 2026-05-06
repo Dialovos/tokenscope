@@ -9,7 +9,10 @@ use libbpf_cargo::SkeletonBuilder;
 
 /// Each entry: (BPF source filename, generated skeleton filename).
 /// Add new probes here as they're written.
-const PROGRAMS: &[(&str, &str)] = &[("sched_exec.bpf.c", "sched_exec.skel.rs")];
+const PROGRAMS: &[(&str, &str)] = &[
+    ("sched_exec.bpf.c", "sched_exec.skel.rs"),
+    ("net.bpf.c", "net.skel.rs"),
+];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

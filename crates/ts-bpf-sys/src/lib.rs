@@ -17,4 +17,8 @@ pub mod sched_exec {
     include!(concat!(env!("OUT_DIR"), "/sched_exec.skel.rs"));
 }
 
+pub mod net {
+    include!(concat!(env!("OUT_DIR"), "/net.skel.rs"));
+}
+
 pub use libbpf_rs;
