@@ -7,6 +7,8 @@
 
 mod cgroup;
 mod net_bytes;
+#[allow(dead_code)]
+mod proc_cache;
 mod skeletons;
 
 use std::time::{Duration, Instant};
