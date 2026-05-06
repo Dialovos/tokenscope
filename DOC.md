@@ -24,6 +24,26 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.C — Process Enrichment via /proc (shipped 2026-05-06, tag `v0.0.4-phase1c`)
+
+Userspace `proc_cache` resolves `pid → {comm, cmdline}` lazily from `/proc/<pid>/comm` and `/proc/<pid>/cmdline`. Both the ringbuf event handler and the periodic net_bytes flush borrow the cache via closures (single-threaded; `RefCell` for interior mutability). Every event line tsd prints — `ProcExec`, `NetConnect`, `NetBytes` — now includes `comm:` and `cmdline:` fields.
+
+Cache: 4096-entry FIFO eviction, sentinel values (`<gone>` / `<denied>` / `<error>`) for unreadable PIDs so a single failed lookup doesn't trigger repeated /proc reads. No BPF or wire-format changes — pure userspace. handle_event looks up by `hdr.tgid` (userspace PID), not `hdr.pid` (kernel TID), so non-leader threads correctly resolve to their parent process's /proc entry.
+
+**Gate evidence (verified 2026-05-06):**
+- `cargo fmt --check` / `cargo clippy -D warnings` clean
+- `cargo test --workspace` — 13 ts-core + 9 tsd proc_cache unit tests pass (22 total)
+- `sudo cargo test -p tsd -- --ignored` — four tests pass: `exec_event`, `connect_event`, `bytes_event`, `netconnect_line_has_enrichment_fields`
+- Plan: `docs/superpowers/plans/2026-05-06-phase-1c-proc-enrichment.md`
+
+**Known limitation — short-lived process race:**
+For processes that exit and get reaped within ~milliseconds of generating an event (e.g., `curl example.com` finishing before tsd's 200ms ringbuf poll runs), `/proc/<pid>/` disappears before the cache lookup. Affected lines show `comm: "<gone>"`. Long-lived processes (servers, sshd, top, etc.) enrich correctly. **Fix lives in Phase 1.D**, which adds `bpf_get_current_comm()` to the BPF event payloads — captures comm at event time, eliminating the race entirely. This was deliberately scoped out of 1.C to avoid a wire-format change here.
+
+**Other gaps:**
+- No PID-reuse detection (cache trusts pid; fix in 1.D using /proc/<pid>/stat start_time)
+- No exit-driven invalidation (FIFO eviction handles it eventually)
+- exe / uid / gid / cgroup_path not captured (1.D when DuckDB schema needs them)
+
 ### Phase 1.B — TCP Byte Counting (shipped 2026-05-06, tag `v0.0.3-phase1b`)
 
 Two fexit programs (`fexit/tcp_sendmsg` + `fexit/tcp_recvmsg`) accumulate per-socket TX/RX bytes into a `BPF_MAP_TYPE_LRU_HASH` keyed by `bpf_get_socket_cookie()`. tsd flushes the map every `--flush-interval-ms` (default 5000 ms) and prints `NetBytes { sock_cookie, pid, tx, rx, last_ns }` lines on stdout. Map is cumulative; LRU eviction at 65k sockets.
