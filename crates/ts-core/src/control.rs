@@ -20,6 +20,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum Request {
     Status,
     Tail,
+    Query { sql: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +80,31 @@ pub enum TailEvent {
         tx: u64,
         rx: u64,
         last_event_ns: u64,
+    },
+}
+
+/// Streamed response to a `Request::Query`. The server sends exactly
+/// one `Header` (or zero, if prepare itself fails), then zero or more
+/// `Row`s, then exactly one terminator: `End` on success, `Error` on
+/// failure or hard-cap overflow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryFrame {
+    Header {
+        columns: Vec<String>,
+    },
+    Row {
+        /// One stringified value per column. Cells longer than 64 KiB
+        /// are truncated by the server (at the last UTF-8 char
+        /// boundary) and suffixed with `…[+N more bytes]`.
+        values: Vec<String>,
+    },
+    End {
+        row_count: u64,
+        elapsed_ms: u64,
+    },
+    Error {
+        message: String,
     },
 }
 
@@ -167,5 +193,56 @@ mod tests {
         assert!(s.contains(r#""type":"net_bytes""#));
         assert!(s.contains(r#""tx":1024"#));
         assert_eq!(serde_json::from_str::<TailEvent>(&s).unwrap(), e);
+    }
+
+    #[test]
+    fn request_query_round_trip() {
+        let r = Request::Query {
+            sql: "SELECT 1".into(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"op":"query","sql":"SELECT 1"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn query_frame_header_round_trip() {
+        let f = QueryFrame::Header {
+            columns: vec!["comm".into(), "n".into()],
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""kind":"header""#));
+        assert_eq!(serde_json::from_str::<QueryFrame>(&s).unwrap(), f);
+    }
+
+    #[test]
+    fn query_frame_row_round_trip() {
+        let f = QueryFrame::Row {
+            values: vec!["curl".into(), "42".into()],
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""kind":"row""#));
+        assert_eq!(serde_json::from_str::<QueryFrame>(&s).unwrap(), f);
+    }
+
+    #[test]
+    fn query_frame_end_round_trip() {
+        let f = QueryFrame::End {
+            row_count: 2,
+            elapsed_ms: 4,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""kind":"end""#));
+        assert_eq!(serde_json::from_str::<QueryFrame>(&s).unwrap(), f);
+    }
+
+    #[test]
+    fn query_frame_error_round_trip() {
+        let f = QueryFrame::Error {
+            message: "syntax error".into(),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""kind":"error""#));
+        assert_eq!(serde_json::from_str::<QueryFrame>(&s).unwrap(), f);
     }
 }
