@@ -1,13 +1,14 @@
-//! TokenScope daemon (Phase 1.E).
+//! TokenScope daemon (Phase 1.F).
 //!
 //! Loads BPF skeletons, drains ringbufs, periodically flushes the
-//! per-socket byte counter map. Two sinks now: stdout (live human
-//! view, suppressible with --no-stdout) and a DuckDB file (queryable
-//! system of record, default ~/.local/share/tokenscope/events.duckdb).
-//! SIGINT/SIGTERM flip an atomic flag so the main loop exits cleanly
-//! and DuckDB closes its file consistently.
+//! per-socket byte counter map. Three sinks: stdout (live human
+//! view, suppressible), DuckDB (queryable system of record), and the
+//! Unix-domain control plane (status responses + live tail
+//! subscriptions). SIGINT/SIGTERM flip an atomic flag so the main
+//! loop and the control listener exit cleanly.
 
 mod cgroup;
+mod control;
 mod net_bytes;
 mod proc_cache;
 mod skeletons;
@@ -25,8 +26,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use ts_bpf_sys::libbpf_rs::RingBufferBuilder;
+use ts_core::control::TailEvent;
 use ts_core::{decode_header, decode_net_connect, TsEventType};
 
+use crate::control::{Counters, Subscribers};
 use crate::proc_cache::ProcessCache;
 use crate::skeletons::{load_all, SkelStorage};
 use crate::store::Store;
@@ -46,9 +49,19 @@ struct Args {
     #[arg(long, default_value_os_t = default_db_path())]
     db_path: PathBuf,
 
-    /// Suppress live stdout printing. The DuckDB sink still receives all events.
+    /// Suppress live stdout printing. The DuckDB sink and control
+    /// plane still receive all events.
     #[arg(long)]
     no_stdout: bool,
+
+    /// Path to the Unix domain socket tsctl connects to. Default:
+    /// $XDG_RUNTIME_DIR/tokenscope/tsd.sock (falls back to /run/tokenscope/tsd.sock).
+    #[arg(long, default_value_os_t = control::default_uds_path())]
+    uds_path: PathBuf,
+
+    /// Skip starting the control-plane listener.
+    #[arg(long)]
+    no_control: bool,
 }
 
 fn default_db_path() -> PathBuf {
@@ -68,7 +81,9 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("tsd starting (Phase 1.E — sched_exec + cgroup/connect + tcp bytes + DuckDB sink)");
+    info!(
+        "tsd starting (Phase 1.F — sched_exec + cgroup/connect + tcp bytes + DuckDB + UDS control)"
+    );
     info!(db_path = %args.db_path.display(), "opening store");
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
@@ -80,7 +95,6 @@ fn main() -> Result<()> {
     let store = RefCell::new(Store::open(&args.db_path).context("open DuckDB store")?);
     let stdout_enabled = !args.no_stdout;
 
-    // Shutdown flag — flipped by SIGINT/SIGTERM via the ctrlc handler.
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let s = shutdown.clone();
@@ -88,15 +102,50 @@ fn main() -> Result<()> {
             .context("install signal handler")?;
     }
 
+    let counters = Arc::new(Counters::default());
+    let subscribers = Subscribers::new(counters.clone());
+    let started_at = Instant::now();
+
+    let _control_server = if args.no_control {
+        info!("control plane disabled (--no-control)");
+        None
+    } else {
+        Some(
+            control::ControlServer::start(
+                args.uds_path.clone(),
+                args.db_path.clone(),
+                subscribers.clone(),
+                counters.clone(),
+                started_at,
+                shutdown.clone(),
+            )
+            .context("start control plane")?,
+        )
+    };
+
     let mut builder = RingBufferBuilder::new();
     builder
         .add(&skels.sched.maps.events, |data| {
-            handle_event(data, &cache, &store, stdout_enabled)
+            handle_event(
+                data,
+                &cache,
+                &store,
+                &subscribers,
+                &counters,
+                stdout_enabled,
+            )
         })
         .map_err(|e| anyhow!("add sched ringbuf: {e}"))?;
     builder
         .add(&skels.net.maps.events, |data| {
-            handle_event(data, &cache, &store, stdout_enabled)
+            handle_event(
+                data,
+                &cache,
+                &store,
+                &subscribers,
+                &counters,
+                stdout_enabled,
+            )
         })
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
@@ -107,24 +156,47 @@ fn main() -> Result<()> {
     while !shutdown.load(Ordering::Relaxed) {
         if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
             error!(?e, "ringbuf poll error");
+            counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
         }
         if last_flush.elapsed() >= flush_interval {
-            net_bytes::flush(&skels.net.maps.net_bytes, &cache, &store, stdout_enabled);
+            net_bytes::flush(
+                &skels.net.maps.net_bytes,
+                &cache,
+                &store,
+                &subscribers,
+                &counters,
+                stdout_enabled,
+            );
             last_flush = Instant::now();
         }
     }
 
-    info!("shutting down — flushing one last time and closing store");
-    net_bytes::flush(&skels.net.maps.net_bytes, &cache, &store, stdout_enabled);
-    // Natural drop order: ringbuf releases its closure-borrows first,
-    // then `store` (and its DuckDB Connection) is dropped on scope exit.
+    info!("shutting down — flushing once and closing");
+    net_bytes::flush(
+        &skels.net.maps.net_bytes,
+        &cache,
+        &store,
+        &subscribers,
+        &counters,
+        stdout_enabled,
+    );
+    // Drop order on scope exit:
+    //   ringbuf  -> releases closure borrows on &subscribers / &counters / &store
+    //   _control_server -> Drop flips its own shutdown, joins listener, removes socket
+    //   store    -> closes DuckDB
+    //   subscribers / counters -> Arcs go to zero
+    // No explicit drops needed; the natural reverse-declaration order
+    // handles everything.
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     data: &[u8],
     cache: &RefCell<ProcessCache>,
     store: &RefCell<Store>,
+    subscribers: &Subscribers,
+    counters: &Counters,
     stdout: bool,
 ) -> i32 {
     let hdr = match decode_header(data) {
@@ -166,6 +238,18 @@ fn handle_event(
             ) {
                 warn!(?e, "store proc_exec");
             }
+            let event = TailEvent::ProcExec {
+                ts_ns: hdr.ts_ns,
+                pid: hdr.pid,
+                tgid: hdr.tgid,
+                comm: comm.clone(),
+                cmdline: cmdline.clone(),
+                cgroup_id: format!("{:#x}", hdr.cgroup_id),
+            };
+            if let Ok(line) = serde_json::to_string(&event) {
+                subscribers.broadcast(&line);
+            }
+            counters.events_total.fetch_add(1, Ordering::Relaxed);
         }
         Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
             Ok(pl) => {
@@ -193,6 +277,21 @@ fn handle_event(
                 ) {
                     warn!(?e, "store net_connect");
                 }
+                let event = TailEvent::NetConnect {
+                    ts_ns: hdr.ts_ns,
+                    pid: hdr.pid,
+                    tgid: hdr.tgid,
+                    comm: comm.clone(),
+                    cmdline: cmdline.clone(),
+                    cgroup_id: format!("{:#x}", hdr.cgroup_id),
+                    dst: pl.dst_string(),
+                    family: pl.family,
+                    protocol: pl.protocol,
+                };
+                if let Ok(line) = serde_json::to_string(&event) {
+                    subscribers.broadcast(&line);
+                }
+                counters.events_total.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => error!(?e, "decode net_connect failed"),
         },
@@ -219,8 +318,7 @@ fn handle_event(
     0
 }
 
-/// Wall-clock nanoseconds since UNIX epoch. Used as the snapshot timestamp
-/// in `events_net_bytes` so queries can correlate with absolute time.
+/// Wall-clock nanoseconds since UNIX epoch.
 pub fn wall_clock_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

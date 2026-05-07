@@ -2512,6 +2512,8 @@ dependencies = [
  "ctrlc",
  "duckdb",
  "libc",
+ "serde",
+ "serde_json",
  "socket2 0.5.10",
  "tempfile",
  "tracing",
