@@ -2501,6 +2501,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ctrlc",
+ "serde",
+ "serde_json",
+ "ts-core",
 ]
 
 [[package]]

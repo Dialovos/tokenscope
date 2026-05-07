@@ -13,5 +13,9 @@ name = "tsctl"
 path = "src/main.rs"
 
 [dependencies]
-clap   = { workspace = true }
-anyhow = { workspace = true }
+clap       = { workspace = true }
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+ctrlc      = { workspace = true }
+ts-core    = { workspace = true }
