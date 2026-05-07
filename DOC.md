@@ -24,6 +24,30 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.E — DuckDB Sink (shipped 2026-05-06, tag `v0.0.6-phase1e`)
+
+Every event tsd processes — `ProcExec`, `NetConnect`, `NetBytes` — is now persisted into an embedded DuckDB at `~/.local/share/tokenscope/events.duckdb` (override with `--db-path`). Stdout output stays unchanged unless `--no-stdout` is passed; the database is the queryable system of record. A `ctrlc` handler on `SIGINT`/`SIGTERM` flips an atomic shutdown flag the main loop watches, so the DuckDB connection drops cleanly on scope exit (after the ringbuf releases its closure-borrows) — no torn writes.
+
+Schema: three event tables (`events_proc_exec`, `events_net_connect`, `events_net_bytes`) plus `schema_version`, embedded as a single SQL string in `tsd::store`. Migrations are idempotent (CREATE IF NOT EXISTS) — the second one will move to a file-based runner.
+
+`net_bytes::flush` writes a row per non-zero LRU map entry every flush window, stamped with a wall-clock snapshot ns so queries can correlate against absolute time.
+
+**Toolchain bumped to 1.86.0** — `duckdb 1.10502.0` requires 1.85.1 and an `icu` transitive needs 1.86.
+
+**Gate evidence (verified 2026-05-06):**
+- `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo test --workspace` — ts-core 13 + tsd lib 14 (proc_cache 9 + store 5) = 27 unit tests pass
+- `sudo cargo test -p tsd -- --ignored` — five integration tests pass
+  - `round_trips_events_through_duckdb` confirms `connect rows: 1, bytes rows: 8, max tx: 1024` after a known 1024-byte loopback transfer through the full pipeline (BPF → ringbuf → store insert → SQL SELECT)
+- Plan: `docs/superpowers/plans/2026-05-06-phase-1e-duckdb-sink.md`
+
+**Known gaps:**
+- No partitioning / rollup / retention (Phase 2; current schema grows linearly per event)
+- Inserts are one-row-at-a-time (no prepared statements, no batching) — fine for hundreds of events/sec; redo when we hit thousands
+- No read API yet — query via the `duckdb` CLI or by the integration test path; `tsctl tail` / `tsctl query` lands in Phase 1.F
+- Schema doesn't carry exe / uid / gid / start_time (Phase 2)
+- First build is slow (~30 min single-threaded) because `duckdb` compiles its bundled C++ amalgamation; incremental rebuilds are seconds. CI will need to cache `target/` aggressively or accept the cold-build cost.
+
 ### Phase 1.D — BPF comm Capture (shipped 2026-05-06, tag `v0.0.5-phase1d`)
 
 `bpf_get_current_comm()` is now called at every event emit site (sched_exec, cgroup/connect, fexit/tcp_sendmsg, fexit/tcp_recvmsg). The 16-byte comm string is carried in `ts_event_hdr` (header grew 40 → 56 bytes) and in `ts_net_bytes_value` (32 → 48 bytes). Userspace reads comm directly from the event, eliminating the /proc race that produced `comm: "<gone>"` for short-lived processes in Phase 1.C.
