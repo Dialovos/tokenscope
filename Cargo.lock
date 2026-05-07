@@ -2509,6 +2509,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "duckdb",
+ "libc",
  "socket2 0.5.10",
  "tempfile",
  "tracing",

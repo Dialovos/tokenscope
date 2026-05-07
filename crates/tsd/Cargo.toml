@@ -25,3 +25,5 @@ ctrlc               = { workspace = true }
 [dev-dependencies]
 socket2  = "0.5"
 tempfile = "3"
+duckdb   = { workspace = true }
+libc     = "0.2"
