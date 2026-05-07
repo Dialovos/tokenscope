@@ -9,4 +9,6 @@ authors       = { workspace = true }
 description   = "Shared wire-format types for TokenScope"
 
 [dependencies]
-thiserror = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
