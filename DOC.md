@@ -24,6 +24,32 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.G — tsctl Query (shipped 2026-05-07, tag `v0.0.8-phase1g`)
+
+`tsctl query <SQL>` ships, completing the Phase 1 user-visible surface. The daemon executes each query in a worker thread that opens an **in-memory** DuckDB primary and `ATTACH '…events.duckdb' AS data (READ_ONLY)` — DuckDB's read-only attach is the designed-for path for "let other tools query my live database file without taking a write lock", and the engine itself rejects any INSERT/UPDATE/DELETE/DDL against an RO-attached database (verified end-to-end: `Cannot execute statement of type "DELETE" on database "data" which is attached in read-only mode!`). SELECT/WITH/VALUES queries are wrapped as `SELECT * FROM (<user_sql>) LIMIT 100000` so a giant result can't materialize before the row counter notices.
+
+Hard caps: 100K rows, 64 KiB per stringified value (truncated at the last UTF-8 char boundary, suffixed with `…[+N more bytes]`), 50 MB cumulative bytes-on-the-wire per query (catches the wide-row vector that row-count alone misses), 4 concurrent queries (RAII semaphore on `Counters.active_queries`), 256-row periodic shutdown poll (long queries don't pin process exit).
+
+tsctl renders rows as a `tabled` ASCII table with `(N rows, M ms)` summary on stderr. The frame loop tracks a `saw_terminator` flag so a daemon disconnect mid-stream returns a clear error instead of pretending success. Each line decodes as either `QueryFrame` or — fallback — `ErrorResponse`, so a new `tsctl` talking to an old `tsd` (one that doesn't know `Query`) surfaces the typed error instead of "missing kind".
+
+**Codex second-opinion review caught three blockers in the initial plan** (`Connection::open_with_flags(path, ReadOnly)` not proven safe alongside live writer in same process → pivoted to `ATTACH READ_ONLY`; `Statement::query()` materializes results before the row cap can fire → added SQL `LIMIT` envelope wrap + cumulative byte cap; resource caps insufficient → added concurrent-query semaphore + per-frame byte tracking) and three should-fixes (no shutdown cancellation in worker → 256-row periodic check; UTF-8 fix lived only in self-review → folded into shipped code; premature EOF + new-tsctl/old-tsd combo → `saw_terminator` flag + `ErrorResponse` fallback). All folded into the final design before any code was written.
+
+**One bug surfaced during execution that the plan missed:** duckdb-rs panics if `Statement::column_names()` is called before `Statement::query()` — different from rusqlite. Fixed by reordering and reading column metadata via `rows.as_ref().column_names()` after `query()` runs. Found within minutes via a focused unit test (`handle_query_emits_full_frame_sequence`) instead of the 30-min e2e rebuild loop. Saved to LEARNED.md.
+
+**Gate evidence (verified 2026-05-07):**
+- `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo test --workspace` — ts-core 25 (20 + 5 QueryFrame round-trip) + tsd lib 22 (proc_cache 9 + store 5 + control 8 = 22) = 47 unit tests pass
+- `sudo cargo test -p tsd -- --ignored` — 7 integration tests pass
+  - `control_plane_query_returns_rows_and_rejects_mutations` confirms (1) `tsctl query "SELECT comm, COUNT(*) FROM events_net_bytes GROUP BY 1"` returns ≥ 1 row and renders as ASCII table, (2) `DELETE FROM events_net_bytes` is rejected with the expected DuckDB error AND rows survive (post-DELETE count = 6), (3) syntactically-invalid SQL exits non-zero with "error" on stderr
+- Plan: `docs/superpowers/plans/2026-05-07-phase-1g-tsctl-query.md`
+
+**Known gaps:**
+- No wall-time query timeout — duckdb-rs 1.10502 doesn't cleanly expose `interrupt_handle()`; bounded by row + value + cumulative-byte caps + 256-row shutdown poll
+- No pagination / cursors — single-shot stream
+- No `--json` / `--csv` output mode for tsctl — Phase 2
+- True streaming via Arrow batches deferred — `LIMIT` wrap + caps are the v1 safety net; revisit when a query routinely produces > 100K rows
+- Concurrent-query limit (4) tested at unit-level only; e2e parallel-tsctl test deferred (CI flake risk)
+
 ### Phase 1.F — tsctl Control Plane (shipped 2026-05-07, tag `v0.0.7-phase1f`)
 
 `tsd` now opens a Unix-domain socket at `${XDG_RUNTIME_DIR}/tokenscope/tsd.sock` (or `/run/tokenscope/tsd.sock` for system-mode) and `tsctl` ships two subcommands that talk to it: `tsctl status` (one-shot snapshot — uptime, db path, probe set, events_total, ringbuf_poll_errors, active tail subscribers) and `tsctl tail` (live newline-delimited JSON event stream, `Ctrl-C` to stop).
