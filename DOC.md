@@ -24,6 +24,20 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.D — BPF comm Capture (shipped 2026-05-06, tag `v0.0.5-phase1d`)
+
+`bpf_get_current_comm()` is now called at every event emit site (sched_exec, cgroup/connect, fexit/tcp_sendmsg, fexit/tcp_recvmsg). The 16-byte comm string is carried in `ts_event_hdr` (header grew 40 → 56 bytes) and in `ts_net_bytes_value` (32 → 48 bytes). Userspace reads comm directly from the event, eliminating the /proc race that produced `comm: "<gone>"` for short-lived processes in Phase 1.C.
+
+The /proc cache is retained for `cmdline` lookups only — that field still has the race, but seeing `comm: "curl", cmdline: "[<gone>]"` is far more useful than two sentinels.
+
+**Gate evidence (verified 2026-05-06):**
+- `cargo fmt --check` / `cargo clippy -D warnings` clean
+- `cargo test --workspace` — 13 ts-core + 9 tsd unit tests pass (22 total)
+- `sudo cargo test -p tsd -- --ignored` — four integration tests pass, all show real comm values (`"true"`, `"captures_tcp_by"`, etc.)
+- Live smoke: `curl example.com` produces `comm: "curl"` lines for both NetConnect and NetBytes
+
+**Wire format break:** This phase changes the on-disk event layout. Pre-1.D ringbuf consumers will see truncated/garbled events. Acceptable pre-1.0; documented for downstream tools.
+
 ### Phase 1.C — Process Enrichment via /proc (shipped 2026-05-06, tag `v0.0.4-phase1c`)
 
 Userspace `proc_cache` resolves `pid → {comm, cmdline}` lazily from `/proc/<pid>/comm` and `/proc/<pid>/cmdline`. Both the ringbuf event handler and the periodic net_bytes flush borrow the cache via closures (single-threaded; `RefCell` for interior mutability). Every event line tsd prints — `ProcExec`, `NetConnect`, `NetBytes` — now includes `comm:` and `cmdline:` fields.
