@@ -19,3 +19,4 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 ctrlc      = { workspace = true }
 ts-core    = { workspace = true }
+tabled     = "0.16"
