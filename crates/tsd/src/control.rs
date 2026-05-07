@@ -288,6 +288,12 @@ fn handle_conn(
     global_shutdown: Arc<AtomicBool>,
     server_shutdown: Arc<AtomicBool>,
 ) {
+    // The accepted stream inherits non-blocking from the listener on
+    // Linux. Force blocking so reads + writes use the configured
+    // timeouts instead of returning WouldBlock immediately.
+    if let Err(e) = stream.set_nonblocking(false) {
+        warn!(?e, "set_nonblocking(false) failed");
+    }
     if let Err(e) = stream.set_read_timeout(Some(READ_REQUEST_TIMEOUT)) {
         warn!(?e, "set_read_timeout failed");
     }
@@ -618,20 +624,8 @@ fn handle_query(
         }
     };
 
-    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-    let col_count = columns.len();
-    if send_frame(
-        writer,
-        &mut bytes_sent,
-        &QueryFrame::Header {
-            columns: columns.clone(),
-        },
-    )
-    .is_err()
-    {
-        return;
-    }
-
+    // duckdb-rs panics if column_names() is called before query(),
+    // so execute first and read column metadata via rows.statement().
     let mut rows = match stmt.query([]) {
         Ok(r) => r,
         Err(e) => {
@@ -645,6 +639,26 @@ fn handle_query(
             return;
         }
     };
+    let columns: Vec<String> = match rows.as_ref() {
+        Some(stmt_ref) => stmt_ref
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    let col_count = columns.len();
+    if send_frame(
+        writer,
+        &mut bytes_sent,
+        &QueryFrame::Header {
+            columns: columns.clone(),
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
 
     let mut row_count: u64 = 0;
     loop {
@@ -750,6 +764,98 @@ mod tests {
         // Output must be valid UTF-8 (String guarantees) and iterating
         // chars must not panic.
         let _ = out.chars().count();
+    }
+
+    /// Repro for the e2e failure: open a writer connection on a
+    /// temp DuckDB file, then in the SAME PROCESS open an in-memory
+    /// connection and ATTACH '...' AS data (READ_ONLY). If this
+    /// returns Err, that's why handle_query is closing the socket
+    /// silently in production (the ATTACH fails before we send any
+    /// frame... wait, we DO send an Error frame on attach failure.
+    /// So if this passes, the bug is elsewhere).
+    #[test]
+    fn attach_readonly_alongside_writer_works() {
+        use crate::store::Store;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.duckdb");
+        // Writer: same code path as production.
+        let _writer = Store::open(&path).expect("open writer");
+
+        // Reader: in-memory + ATTACH READ_ONLY.
+        let conn = duckdb::Connection::open_in_memory().expect("open in-memory");
+        let attach_sql = format!(
+            "ATTACH '{}' AS data (READ_ONLY)",
+            path.display().to_string().replace('\'', "''")
+        );
+        eprintln!("attach_sql: {attach_sql}");
+        conn.execute_batch(&attach_sql).expect("attach read-only");
+        conn.execute_batch("USE data").expect("use data");
+
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM events_net_bytes")
+            .expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        let row = rows.next().expect("next").expect("some row");
+        let n: i64 = row.get(0).expect("get");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn handle_query_emits_full_frame_sequence() {
+        use crate::store::Store;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.duckdb");
+        // Populate the DB with one row so the GROUP BY has something.
+        let store = Store::open(&path).expect("open store");
+        store
+            .insert_net_bytes(1, 0xCAFE, 200, "wget", "[<gone>]", 1024, 2048, 99)
+            .unwrap();
+        drop(store);
+
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        let counters = Arc::new(Counters::default());
+        let global_sd = Arc::new(AtomicBool::new(false));
+        let server_sd = Arc::new(AtomicBool::new(false));
+
+        let path_for_thread = path.clone();
+        let counters_for_thread = counters.clone();
+        let global_sd_for_thread = global_sd.clone();
+        let server_sd_for_thread = server_sd.clone();
+        let join = thread::spawn(move || {
+            handle_query(
+                &mut a,
+                &path_for_thread,
+                "SELECT comm, COUNT(*) AS n FROM events_net_bytes GROUP BY 1 ORDER BY 2 DESC",
+                &counters_for_thread,
+                &global_sd_for_thread,
+                &server_sd_for_thread,
+            );
+        });
+
+        // Read all frames from the other end.
+        let reader = BufReader::new(b);
+        let mut frames: Vec<String> = Vec::new();
+        for line in reader.lines() {
+            match line {
+                Ok(l) => frames.push(l),
+                Err(_) => break,
+            }
+        }
+        join.join().expect("handle_query thread");
+        eprintln!("frames received ({}): ", frames.len());
+        for f in &frames {
+            eprintln!("  {f}");
+        }
+        // Must end with End or Error.
+        assert!(!frames.is_empty(), "no frames at all");
+        let last = frames.last().unwrap();
+        assert!(
+            last.contains(r#""kind":"end""#) || last.contains(r#""kind":"error""#),
+            "last frame should be end or error: {last}"
+        );
     }
 
     #[test]
