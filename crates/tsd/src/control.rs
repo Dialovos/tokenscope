@@ -49,6 +49,9 @@ pub struct Counters {
     pub events_total: AtomicU64,
     pub ringbuf_poll_errors: AtomicU64,
     pub tail_subscribers_active: AtomicU32,
+    /// Currently-executing query workers. Bumped by an RAII guard on
+    /// query entry; checked against MAX_CONCURRENT_QUERIES.
+    pub active_queries: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -341,6 +344,16 @@ fn handle_conn(
             let json = serde_json::to_string(&resp).unwrap_or_default();
             let _ = writeln!(writer, "{json}");
         }
+        Request::Query { sql } => {
+            handle_query(
+                &mut writer,
+                &db_path,
+                &sql,
+                &counters,
+                &global_shutdown,
+                &server_shutdown,
+            );
+        }
         Request::Tail => {
             let (rx, _guard) = subscribers.register();
             // Block on recv with a periodic wakeup so we can notice
@@ -385,4 +398,374 @@ pub fn default_uds_path() -> PathBuf {
         }
     }
     PathBuf::from("/run/tokenscope/tsd.sock")
+}
+
+// -----------------------------------------------------------------------------
+// Query handler (Phase 1.G)
+// -----------------------------------------------------------------------------
+
+/// Per-stringified-value cap. Cells longer get truncated.
+const MAX_VALUE_BYTES: usize = 64 * 1024;
+
+/// Hard cap on rows a single query can return. Enforced via a SQL
+/// envelope wrap on SELECT/WITH/VALUES; pass-through queries
+/// (EXPLAIN/SHOW/DESCRIBE/PRAGMA) are bounded by their own definition.
+const MAX_QUERY_ROWS: u64 = 100_000;
+
+/// Cumulative bytes-on-the-wire cap per query. Catches the "wide rows
+/// of huge text/blob" vector that row-count alone misses.
+const MAX_QUERY_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Server-side concurrent-query limit. Past this the next query is
+/// rejected with an Error frame, no thread is spawned for the work.
+const MAX_CONCURRENT_QUERIES: u32 = 4;
+
+/// How often (in rows) the worker checks the shutdown flag.
+const SHUTDOWN_POLL_EVERY_N_ROWS: u64 = 256;
+
+/// Stringify a DuckDB value for the wire. Cells longer than the cap
+/// are truncated AT THE LAST UTF-8 CHAR BOUNDARY (so we never split
+/// a multi-byte codepoint) and suffixed with `…[+N more bytes]`.
+fn value_to_display(v: &duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    let s = match v {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Double(n) => n.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+        Value::Timestamp(_, n) => n.to_string(),
+        Value::Date32(d) => d.to_string(),
+        Value::Time64(_, n) => n.to_string(),
+        other => format!("{other:?}"),
+    };
+    if s.len() > MAX_VALUE_BYTES {
+        let mut end = MAX_VALUE_BYTES;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let extra = s.len() - end;
+        format!("{}…[+{} more bytes]", &s[..end], extra)
+    } else {
+        s
+    }
+}
+
+/// SELECT/WITH/VALUES queries get wrapped with `LIMIT N` so a 100M-row
+/// result can't materialize before our row counter notices. Other
+/// statement types (EXPLAIN/SHOW/DESCRIBE/PRAGMA) pass through —
+/// their result sets are inherently bounded.
+fn maybe_wrap_with_limit(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let head: String = trimmed
+        .lines()
+        .find(|l| !l.trim_start().starts_with("--") && !l.trim().is_empty())
+        .unwrap_or("")
+        .trim_start()
+        .chars()
+        .take(20)
+        .collect::<String>()
+        .to_uppercase();
+    if head.starts_with("SELECT") || head.starts_with("WITH") || head.starts_with("VALUES") {
+        format!(
+            "SELECT * FROM ({}) AS user_query LIMIT {}",
+            sql, MAX_QUERY_ROWS
+        )
+    } else {
+        sql.to_string()
+    }
+}
+
+/// RAII guard for the active-query counter. Decrements on drop so
+/// any panic / early return / error path still releases the slot.
+struct ActiveQueryGuard {
+    counters: Arc<Counters>,
+}
+
+impl ActiveQueryGuard {
+    /// Try to acquire a slot. Returns `None` if MAX_CONCURRENT_QUERIES
+    /// is already busy.
+    fn try_acquire(counters: Arc<Counters>) -> Option<Self> {
+        let prev = counters.active_queries.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_CONCURRENT_QUERIES {
+            counters.active_queries.fetch_sub(1, Ordering::SeqCst);
+            None
+        } else {
+            Some(Self { counters })
+        }
+    }
+}
+
+impl Drop for ActiveQueryGuard {
+    fn drop(&mut self) {
+        self.counters.active_queries.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Serialize one `QueryFrame` and write it to the wire, accumulating
+/// bytes-sent into the running `bytes_sent` total. Free function so
+/// the handler can keep `bytes_sent` as a local mutable that stays
+/// readable for the cap check (a closure capturing `&mut bytes_sent`
+/// would hold a mutable borrow across the loop's read).
+fn send_frame(
+    writer: &mut UnixStream,
+    bytes_sent: &mut u64,
+    frame: &ts_core::control::QueryFrame,
+) -> Result<()> {
+    let line = serde_json::to_string(frame).context("serialize QueryFrame")?;
+    let frame_size = line.len() as u64 + 1;
+    *bytes_sent = bytes_sent.saturating_add(frame_size);
+    writeln!(writer, "{line}").context("write frame")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_query(
+    writer: &mut UnixStream,
+    db_path: &Path,
+    sql: &str,
+    counters: &Arc<Counters>,
+    global_shutdown: &Arc<AtomicBool>,
+    server_shutdown: &Arc<AtomicBool>,
+) {
+    use duckdb::types::Value;
+    use ts_core::control::QueryFrame;
+
+    let started = Instant::now();
+    let mut bytes_sent: u64 = 0;
+
+    // Concurrent-query limit.
+    let _slot = match ActiveQueryGuard::try_acquire(counters.clone()) {
+        Some(g) => g,
+        None => {
+            let _ = send_frame(
+                writer,
+                &mut bytes_sent,
+                &QueryFrame::Error {
+                    message: format!(
+                        "server too busy: {MAX_CONCURRENT_QUERIES} concurrent queries already running"
+                    ),
+                },
+            );
+            return;
+        }
+    };
+
+    // In-memory primary + ATTACH READ_ONLY of the daemon's DB file.
+    // RO attach is DuckDB's designed-for path for "let other tools
+    // query my live database file without taking a write lock".
+    let conn = match duckdb::Connection::open_in_memory() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = send_frame(
+                writer,
+                &mut bytes_sent,
+                &QueryFrame::Error {
+                    message: format!("open in-memory: {e}"),
+                },
+            );
+            return;
+        }
+    };
+    let attach_sql = format!(
+        "ATTACH '{}' AS data (READ_ONLY)",
+        db_path.display().to_string().replace('\'', "''")
+    );
+    if let Err(e) = conn.execute_batch(&attach_sql) {
+        let _ = send_frame(
+            writer,
+            &mut bytes_sent,
+            &QueryFrame::Error {
+                message: format!("attach read-only: {e}"),
+            },
+        );
+        return;
+    }
+    if let Err(e) = conn.execute_batch("USE data") {
+        let _ = send_frame(
+            writer,
+            &mut bytes_sent,
+            &QueryFrame::Error {
+                message: format!("use data: {e}"),
+            },
+        );
+        return;
+    }
+
+    let effective_sql = maybe_wrap_with_limit(sql);
+
+    let mut stmt = match conn.prepare(&effective_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = send_frame(
+                writer,
+                &mut bytes_sent,
+                &QueryFrame::Error {
+                    message: format!("prepare: {e}"),
+                },
+            );
+            return;
+        }
+    };
+
+    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_count = columns.len();
+    if send_frame(
+        writer,
+        &mut bytes_sent,
+        &QueryFrame::Header {
+            columns: columns.clone(),
+        },
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = send_frame(
+                writer,
+                &mut bytes_sent,
+                &QueryFrame::Error {
+                    message: format!("execute: {e}"),
+                },
+            );
+            return;
+        }
+    };
+
+    let mut row_count: u64 = 0;
+    loop {
+        if row_count % SHUTDOWN_POLL_EVERY_N_ROWS == 0
+            && (global_shutdown.load(Ordering::Relaxed) || server_shutdown.load(Ordering::Relaxed))
+        {
+            let _ = send_frame(
+                writer,
+                &mut bytes_sent,
+                &QueryFrame::Error {
+                    message: "daemon shutting down".to_string(),
+                },
+            );
+            return;
+        }
+        match rows.next() {
+            Ok(Some(row)) => {
+                let mut values: Vec<String> = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let v: Value = row.get(i).unwrap_or(Value::Null);
+                    values.push(value_to_display(&v));
+                }
+                if send_frame(writer, &mut bytes_sent, &QueryFrame::Row { values }).is_err() {
+                    return;
+                }
+                row_count += 1;
+                if bytes_sent > MAX_QUERY_BYTES {
+                    let _ = send_frame(
+                        writer,
+                        &mut bytes_sent,
+                        &QueryFrame::Error {
+                            message: format!(
+                                "byte cap ({} MiB) exceeded after {} rows",
+                                MAX_QUERY_BYTES / 1024 / 1024,
+                                row_count
+                            ),
+                        },
+                    );
+                    return;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = send_frame(
+                    writer,
+                    &mut bytes_sent,
+                    &QueryFrame::Error {
+                        message: format!("row iter: {e}"),
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    let _ = send_frame(
+        writer,
+        &mut bytes_sent,
+        &QueryFrame::End {
+            row_count,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_select_adds_limit() {
+        let out = maybe_wrap_with_limit("SELECT 1");
+        assert!(out.contains("LIMIT 100000"), "{out}");
+        assert!(out.contains("SELECT 1"), "{out}");
+    }
+
+    #[test]
+    fn wrap_with_cte_adds_limit() {
+        let out = maybe_wrap_with_limit("WITH x AS (SELECT 1) SELECT * FROM x");
+        assert!(out.contains("LIMIT 100000"), "{out}");
+    }
+
+    #[test]
+    fn wrap_explain_passes_through() {
+        let out = maybe_wrap_with_limit("EXPLAIN SELECT 1");
+        assert_eq!(out, "EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn wrap_pragma_passes_through() {
+        let out = maybe_wrap_with_limit("PRAGMA show_tables");
+        assert_eq!(out, "PRAGMA show_tables");
+    }
+
+    #[test]
+    fn value_truncation_respects_utf8_boundary() {
+        let pad = "a".repeat(MAX_VALUE_BYTES - 1);
+        let s = format!("{pad}🦀");
+        assert!(s.len() > MAX_VALUE_BYTES);
+        let v = duckdb::types::Value::Text(s);
+        let out = value_to_display(&v);
+        assert!(out.contains("…[+"));
+        // Output must be valid UTF-8 (String guarantees) and iterating
+        // chars must not panic.
+        let _ = out.chars().count();
+    }
+
+    #[test]
+    fn active_query_guard_caps_concurrency() {
+        let counters = Arc::new(Counters::default());
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_QUERIES {
+            held.push(ActiveQueryGuard::try_acquire(counters.clone()).expect("under cap"));
+        }
+        assert!(
+            ActiveQueryGuard::try_acquire(counters.clone()).is_none(),
+            "{}-th acquire should fail",
+            MAX_CONCURRENT_QUERIES + 1
+        );
+        drop(held);
+        assert_eq!(counters.active_queries.load(Ordering::Relaxed), 0);
+        assert!(ActiveQueryGuard::try_acquire(counters.clone()).is_some());
+    }
 }
