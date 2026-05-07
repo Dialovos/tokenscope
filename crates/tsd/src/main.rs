@@ -10,6 +10,7 @@ mod cgroup;
 mod net_bytes;
 mod proc_cache;
 mod skeletons;
+mod store;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
