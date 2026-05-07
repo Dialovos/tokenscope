@@ -92,6 +92,100 @@ impl Store {
         Ok(())
     }
 
+    /// Insert one ProcExec row. cmdline may be empty/sentinel; we still
+    /// store it as-is — it's the cheapest format for queries to filter on.
+    pub fn insert_proc_exec(
+        &self,
+        ts_ns: u64,
+        pid: u32,
+        tgid: u32,
+        cgroup_id: u64,
+        comm: &str,
+        cmdline: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO events_proc_exec (ts_ns, pid, tgid, cgroup_id, comm, cmdline)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    ts_ns as i64,
+                    pid as i32,
+                    tgid as i32,
+                    cgroup_id as i64,
+                    comm,
+                    cmdline
+                ],
+            )
+            .context("insert proc_exec")?;
+        Ok(())
+    }
+
+    pub fn insert_net_connect(
+        &self,
+        ts_ns: u64,
+        pid: u32,
+        tgid: u32,
+        cgroup_id: u64,
+        comm: &str,
+        cmdline: &str,
+        dst_addr: &[u8; 16],
+        dst_port: u16,
+        family: u16,
+        protocol: u8,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO events_net_connect
+                 (ts_ns, pid, tgid, cgroup_id, comm, cmdline, dst_addr, dst_port, family, protocol)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    ts_ns as i64,
+                    pid as i32,
+                    tgid as i32,
+                    cgroup_id as i64,
+                    comm,
+                    cmdline,
+                    dst_addr.as_slice(),
+                    dst_port as i32,
+                    family as i16,
+                    protocol as i16,
+                ],
+            )
+            .context("insert net_connect")?;
+        Ok(())
+    }
+
+    pub fn insert_net_bytes(
+        &self,
+        snapshot_ts_ns: u64,
+        sock_cookie: u64,
+        pid: u32,
+        comm: &str,
+        cmdline: &str,
+        tx_bytes: u64,
+        rx_bytes: u64,
+        last_event_ns: u64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO events_net_bytes
+                 (snapshot_ts_ns, sock_cookie, pid, comm, cmdline, tx_bytes, rx_bytes, last_event_ns)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    snapshot_ts_ns as i64,
+                    sock_cookie as i64,
+                    pid as i32,
+                    comm,
+                    cmdline,
+                    tx_bytes as i64,
+                    rx_bytes as i64,
+                    last_event_ns as i64,
+                ],
+            )
+            .context("insert net_bytes")?;
+        Ok(())
+    }
+
     /// Test-only smoke check: run a SELECT and return the count.
     #[cfg(test)]
     pub(crate) fn count_table(&self, table: &str) -> Result<i64> {
@@ -135,5 +229,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_proc_exec_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("events.duckdb")).unwrap();
+        store
+            .insert_proc_exec(123_456_789, 4242, 4242, 0x15, "sleep", "/bin/sleep 30")
+            .unwrap();
+        let (comm, cmdline): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT comm, cmdline FROM events_proc_exec WHERE pid = 4242",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(comm, "sleep");
+        assert_eq!(cmdline, "/bin/sleep 30");
+    }
+
+    #[test]
+    fn insert_net_connect_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("events.duckdb")).unwrap();
+        let addr: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
+        store
+            .insert_net_connect(999, 100, 100, 0x15, "curl", "[<gone>]", &addr, 443, 2, 6)
+            .unwrap();
+        let (port, family, proto): (i32, i16, i16) = store
+            .conn
+            .query_row(
+                "SELECT dst_port, family, protocol FROM events_net_connect WHERE pid = 100",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(port, 443);
+        assert_eq!(family, 2);
+        assert_eq!(proto, 6);
+    }
+
+    #[test]
+    fn insert_net_bytes_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("events.duckdb")).unwrap();
+        store
+            .insert_net_bytes(1, 0xCAFE, 200, "wget", "[<gone>]", 1024, 2048, 99)
+            .unwrap();
+        let (tx, rx): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT tx_bytes, rx_bytes FROM events_net_bytes WHERE pid = 200",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tx, 1024);
+        assert_eq!(rx, 2048);
     }
 }
