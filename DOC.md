@@ -24,6 +24,32 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 1.F — tsctl Control Plane (shipped 2026-05-07, tag `v0.0.7-phase1f`)
+
+`tsd` now opens a Unix-domain socket at `${XDG_RUNTIME_DIR}/tokenscope/tsd.sock` (or `/run/tokenscope/tsd.sock` for system-mode) and `tsctl` ships two subcommands that talk to it: `tsctl status` (one-shot snapshot — uptime, db path, probe set, events_total, ringbuf_poll_errors, active tail subscribers) and `tsctl tail` (live newline-delimited JSON event stream, `Ctrl-C` to stop).
+
+Architecture: tsd spawns one OS thread that owns the listener; per accepted connection it spawns a short worker thread. The main loop publishes events via a non-blocking try_send to a `HashMap<u64, SyncSender<String>>` of subscribers — slow tail clients drop frames, ingest is never blocked. Subscribers are RAII (Drop guard removes from registry → `tail_subscribers_active` atomic stays accurate). `ControlServer::Drop` flips a server-local shutdown flag before joining the listener so early-return code paths cannot deadlock. Safe socket startup probes for a live daemon (try-connect) and refuses to overwrite anything that isn't a stale socket.
+
+Wire types live in `ts_core::control` with full serde derives. JSON tag is `op` for requests and `type` for tail events; bad requests come back as a typed `ErrorResponse {"error": "..."}`. Per SPEC §10 these are stable surfaces — adding variants is a minor bump in pre-1.0; renames/removes are major.
+
+**Codex second-opinion review caught three blockers in the initial plan** (DuckDB cross-process query unsafe; ControlServer::Drop deadlock; blind socket unlink) and several should-fixes (RAII subscriber unregister; read/write timeouts; max request line length; rename misleading `ringbuf_drops`). All folded into the final design before any code was written.
+
+**Gate evidence (verified 2026-05-07):**
+- `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo test --workspace` — ts-core 20 (13 + 7 control round-trip) + tsd lib 14 = 34 unit tests pass
+- `sudo cargo test -p tsd -- --ignored` — 6 integration tests pass
+  - `control_plane_status_and_tail` confirms a live tsd answers `tsctl status` (with `events_total = 6` after a known transfer + parsed `StatusResponse`) and `tsctl tail` (12 JSON event lines from /bin/true triggers, mix of `proc_exec` and `net_bytes` variants)
+- Plan: `docs/superpowers/plans/2026-05-06-phase-1f-tsctl-control-plane.md`
+
+**Known gaps:**
+- `tsctl query <SQL>` deferred to Phase 1.G — DuckDB does not allow concurrent reader+writer across processes; query has to be routed over UDS so the daemon's connection executes it
+- Tail filters (`--filter 'provider=anthropic'`) — Phase 2 once parsers exist
+- `tsctl probes attach/detach` — Phase 2 (probe set is fixed at compile time today)
+- No authentication beyond UDS file permissions (0600 socket, 0700 parent dir); root or the tsd user can subscribe
+- No reconnection / retry in `tsctl tail` — if tsd restarts, tail exits
+- `ringbuf_poll_errors` is the userspace `poll()` error count, NOT a true BPF ringbuf-drop counter; the latter needs `bpf_ringbuf_query(0)` and lands in Phase 2
+- Release builds with `panic = "abort"` skip Drop, so the socket file can be left on the floor by an OOM kill or panic; `safe_bind` handles this on next start
+
 ### Phase 1.E — DuckDB Sink (shipped 2026-05-06, tag `v0.0.6-phase1e`)
 
 Every event tsd processes — `ProcExec`, `NetConnect`, `NetBytes` — is now persisted into an embedded DuckDB at `~/.local/share/tokenscope/events.duckdb` (override with `--db-path`). Stdout output stays unchanged unless `--no-stdout` is passed; the database is the queryable system of record. A `ctrlc` handler on `SIGINT`/`SIGTERM` flips an atomic shutdown flag the main loop watches, so the DuckDB connection drops cleanly on scope exit (after the ringbuf releases its closure-borrows) — no torn writes.
