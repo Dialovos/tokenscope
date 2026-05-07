@@ -120,6 +120,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // mirrors the BPF event payload one-to-one
     pub fn insert_net_connect(
         &self,
         ts_ns: u64,
@@ -155,6 +156,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // mirrors the BPF map key+value one-to-one
     pub fn insert_net_bytes(
         &self,
         snapshot_ts_ns: u64,

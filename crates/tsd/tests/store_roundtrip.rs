@@ -80,7 +80,9 @@ fn round_trips_events_through_duckdb() {
     );
 
     let max_tx: i64 = conn
-        .query_row("SELECT MAX(tx_bytes) FROM events_net_bytes", [], |r| r.get(0))
+        .query_row("SELECT MAX(tx_bytes) FROM events_net_bytes", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(
         max_tx >= PAYLOAD.len() as i64,
