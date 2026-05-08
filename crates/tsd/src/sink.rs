@@ -141,17 +141,78 @@ fn writer_loop(
     rx: Receiver<EventEnvelope>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // Hold a long-lived Appender for events_tls_plaintext alongside the
+    // Connection. Both live until this function returns (the join in
+    // EventSink::Drop), at which point the Appender is dropped first
+    // (lifetime), then the Store/Connection.
+    //
+    // If creating the Appender fails (shouldn't — schema is migrated by
+    // Store::open), TLS records still flow through subscribers; just
+    // the persistence side becomes a no-op WARN per record.
+    let mut tls_appender: Option<duckdb::Appender<'_>> = match store.tls_appender() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            tracing::warn!(error = ?e, "could not create TLS appender; tls persistence disabled");
+            None
+        }
+    };
+    let mut last_flush = std::time::Instant::now();
+    const TLS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(env) => {
-                if let Err(e) = persist(&store, &env) {
-                    tracing::warn!(error=?e, "store insert failed");
+                match &env {
+                    EventEnvelope::TlsPlaintext(e) if tls_appender.is_some() => {
+                        let app = tls_appender.as_mut().unwrap();
+                        if let Err(err) = app.append_row(duckdb::params![
+                            e.ts_ns as i64,
+                            e.pid as i32,
+                            e.tgid as i32,
+                            e.cgroup_id as i64,
+                            e.comm.as_str(),
+                            e.ssl_ctx as i64,
+                            e.call_id as i64,
+                            e.direction as i8,
+                            e.total_bytes as i32,
+                            e.chunk_index as i16,
+                            e.chunk_total as i16,
+                            e.chunk_bytes as i16,
+                            e.truncated,
+                            e.read_failed,
+                            e.ex_variant,
+                            e.plaintext.as_slice(),
+                        ]) {
+                            tracing::warn!(error = ?err, "tls appender row failed");
+                        }
+                    }
+                    other => {
+                        if let Err(e) = persist(&store, other) {
+                            tracing::warn!(error=?e, "store insert failed");
+                        }
+                    }
                 }
                 subs.broadcast_envelope(&env);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Flush the TLS appender on the idle tick so writes
+                // become visible to readers within ~1s of arrival.
+                if last_flush.elapsed() > TLS_FLUSH_INTERVAL {
+                    if let Some(app) = tls_appender.as_mut() {
+                        if let Err(e) = app.flush() {
+                            tracing::warn!(error = ?e, "tls appender flush failed");
+                        }
+                    }
+                    last_flush = std::time::Instant::now();
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // Final flush so shutdown doesn't strand buffered TLS rows.
+    if let Some(mut app) = tls_appender.take() {
+        let _ = app.flush();
     }
 }
 
@@ -183,8 +244,8 @@ fn persist(store: &Store, env: &EventEnvelope) -> Result<()> {
             e.last_event_ns,
         ),
         EventEnvelope::TlsPlaintext(_) => {
-            // Filled in by Task 11 (Appender path). For now this is a no-op
-            // so the refactor lands without a TLS table.
+            // Handled directly in writer_loop via the long-lived
+            // Appender — never reached.
             Ok(())
         }
     }

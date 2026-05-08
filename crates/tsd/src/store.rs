@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use duckdb::Connection;
+use duckdb::{Appender, Connection};
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS events_proc_exec (
@@ -123,6 +123,19 @@ impl Store {
                 .context("record schema v2")?;
         }
         Ok(())
+    }
+
+    /// Open an `Appender` for `events_tls_plaintext`. Phase 2.A's TLS
+    /// records can burst at thousands/second; per-row INSERT is a known
+    /// throughput cliff. The Appender batches inserts internally; the
+    /// caller is responsible for `.flush()`-ing periodically and on
+    /// drop. Borrows `&self.conn` for the appender's lifetime — the
+    /// EventSink writer thread owns both the Store and the Appender,
+    /// so the lifetime is naturally bounded.
+    pub fn tls_appender(&self) -> Result<Appender<'_>> {
+        self.conn
+            .appender("events_tls_plaintext")
+            .context("create events_tls_plaintext appender")
     }
 
     /// Insert one ProcExec row. cmdline may be empty/sentinel; we still
