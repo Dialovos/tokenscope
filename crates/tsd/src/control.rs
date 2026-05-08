@@ -61,6 +61,30 @@ pub struct Counters {
     /// from `tail_dropped_events`, which counts subscriber-side drops.
     /// Surfaced by tsctl status as the writer-thread backpressure signal.
     pub sink_dropped_events: AtomicU64,
+
+    // ---- Phase 2.A TLS counters (populated by tls.rs) ----
+    /// Distinct (dev, ino) libssl files currently attached.
+    pub tls_libs_attached: AtomicU32,
+    /// libssl files skipped because symbol resolution failed entirely.
+    pub tls_libs_skipped: AtomicU32,
+    /// libssl files where SSL_read/write attached but _ex variants didn't.
+    pub tls_libs_partial_attach: AtomicU32,
+    /// TLS plaintext records flowed through the userspace consumer.
+    pub tls_records_emitted: AtomicU64,
+    /// Records flagged TLS_FLAG_TRUNCATED (call exceeded 64 KiB).
+    pub tls_truncated_calls: AtomicU64,
+    /// Records flagged TLS_FLAG_READ_FAILED (bpf_probe_read_user error).
+    pub tls_read_failed_chunks: AtomicU64,
+    /// Aggregated from BPF tls_inflight_collision percpu counter.
+    pub tls_inflight_collisions: AtomicU64,
+    /// Aggregated from BPF tls_reserve_fail percpu counter.
+    pub tls_reserve_failures: AtomicU64,
+    /// Last completed /proc rescan duration in microseconds.
+    pub tls_scan_duration_us: AtomicU64,
+    /// /proc/<pid>/maps read errors during the last scan.
+    pub tls_scan_errors: AtomicU32,
+    /// Subset of tail subscribers that asked for include_plaintext=true.
+    pub tls_subscribers_with_plaintext: AtomicU32,
 }
 
 /// Per-subscriber state. Holds the bounded sender plus the rendering

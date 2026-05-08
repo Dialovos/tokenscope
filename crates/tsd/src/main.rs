@@ -14,6 +14,7 @@ mod proc_cache;
 mod sink;
 mod skeletons;
 mod store;
+mod tls;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ use ts_core::{decode_header, decode_net_connect, TsEventType};
 use crate::control::{Counters, Subscribers};
 use crate::proc_cache::ProcessCache;
 use crate::sink::{EventEnvelope, EventSink, NetConnectEvent, ProcExecEvent};
-use crate::skeletons::{load_all, SkelStorage};
+use crate::skeletons::{load_all, LoadedSkels, SkelStorage};
 use crate::store::Store;
 
 #[derive(Parser, Debug)]
@@ -116,9 +117,18 @@ fn main() -> Result<()> {
     cgroup::ensure_bpffs_dir().context("create /sys/fs/bpf/tokenscope")?;
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
-    let mut storage = SkelStorage::new();
-    let skels = load_all(&mut storage, cgroup_root, &tracked_cgroup_ids)
-        .context("load skeletons")?;
+    // Heap-allocate storage + leak so the TLS discovery + ringbuf consumer
+    // threads can hold &'static references to the loaded skeleton.
+    // The leak is bounded by the daemon process lifetime, which is also
+    // when we'd want the BPF programs unloaded — so it's the right
+    // ownership model, not a real "leak".
+    let storage: &'static mut SkelStorage = Box::leak(Box::new(SkelStorage::new()));
+    let skels_owned: &'static mut LoadedSkels<'static> = Box::leak(Box::new(
+        load_all(storage, cgroup_root, &tracked_cgroup_ids).context("load skeletons")?,
+    ));
+    // Demote to shared borrow; ringbuf builder + tls discovery only need
+    // shared access, and `&LoadedSkels` is freely cloneable into closures.
+    let skels: &'static LoadedSkels<'static> = skels_owned;
     info!(
         flush_ms = args.flush_interval_ms,
         tls_cgroup_filter_size = tracked_cgroup_ids.len(),
@@ -164,6 +174,12 @@ fn main() -> Result<()> {
     let event_sink = EventSink::spawn(store, subscribers.clone()).context("spawn EventSink")?;
     let events_tx = event_sink.tx.clone();
 
+    // TLS state lives for the daemon's life and is driven from the
+    // main loop below (libbpf-rs's Program isn't Send, so a separate
+    // discovery thread can't hold attach references — single-thread
+    // tick design instead).
+    let mut tls_state = crate::tls::TlsState::new();
+
     let mut builder = RingBufferBuilder::new();
     builder
         .add(&skels.sched.maps.events, |data| {
@@ -175,6 +191,11 @@ fn main() -> Result<()> {
             handle_event(data, &cache, &events_tx, &counters, stdout_enabled)
         })
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
+    builder
+        .add(&skels.tls.maps.events_tls, |data| {
+            crate::tls::handle_tls_record(data, &events_tx, &counters)
+        })
+        .map_err(|e| anyhow!("add tls ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
 
     let flush_interval = Duration::from_millis(args.flush_interval_ms);
@@ -195,6 +216,8 @@ fn main() -> Result<()> {
             );
             last_flush = Instant::now();
         }
+        // TLS discovery is a no-op until its 5s deadline.
+        crate::tls::discovery_tick(&mut tls_state, skels, &counters);
     }
 
     info!("shutting down — flushing once and closing");

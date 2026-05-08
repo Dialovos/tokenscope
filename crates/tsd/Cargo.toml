@@ -23,6 +23,7 @@ duckdb              = { workspace = true }
 ctrlc               = { workspace = true }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
+regex               = "1"
 
 [dev-dependencies]
 socket2  = "0.5"
