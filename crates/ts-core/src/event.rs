@@ -379,3 +379,159 @@ pub fn decode_net_bytes_value(buf: &[u8]) -> Result<TsNetBytesValue, DecodeError
     }
     Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const TsNetBytesValue) })
 }
+
+/// Mirror of `struct ts_tls_plaintext_payload` in `bpf/ts_event.h`.
+///
+/// Layout (natural alignment, no `packed`):
+/// - 0..8   ssl_ctx
+/// - 8..16  call_id
+/// - 16..24 entry_cgroup_id
+/// - 24..28 total_bytes
+/// - 28..30 chunk_index
+/// - 30..32 chunk_total
+/// - 32..34 chunk_bytes
+/// - 34..35 direction
+/// - 35..36 flags
+/// - 36..40 _pad
+///
+/// Total size: 40 bytes. Alignment: 8.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TsTlsPlaintextPayload {
+    pub ssl_ctx: u64,
+    pub call_id: u64,
+    pub entry_cgroup_id: u64,
+    pub total_bytes: u32,
+    pub chunk_index: u16,
+    pub chunk_total: u16,
+    pub chunk_bytes: u16,
+    pub direction: u8,
+    pub flags: u8,
+    pub _pad: [u8; 4],
+}
+const _: () = assert!(size_of::<TsTlsPlaintextPayload>() == 40);
+const _: () = assert!(align_of::<TsTlsPlaintextPayload>() == 8);
+
+pub const TLS_FLAG_TRUNCATED: u8 = 1 << 0;
+pub const TLS_FLAG_READ_FAILED: u8 = 1 << 1;
+pub const TLS_FLAG_EX_VARIANT: u8 = 1 << 2;
+
+/// Decode a `TsTlsPlaintextPayload` plus the trailing `chunk_bytes` of
+/// plaintext from a single ringbuf record's payload slice (i.e. the bytes
+/// after the [`TsEventHdr`]).
+pub fn decode_tls_plaintext(buf: &[u8]) -> Result<(TsTlsPlaintextPayload, &[u8]), DecodeError> {
+    const HDR: usize = size_of::<TsTlsPlaintextPayload>();
+    if buf.len() < HDR {
+        return Err(DecodeError::Truncated {
+            got: buf.len(),
+            need: HDR,
+        });
+    }
+    let payload =
+        unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const TsTlsPlaintextPayload) };
+    let need_total = HDR + payload.chunk_bytes as usize;
+    if buf.len() < need_total {
+        return Err(DecodeError::BadLength {
+            declared: payload.chunk_bytes as usize,
+            available: buf.len() - HDR,
+        });
+    }
+    Ok((payload, &buf[HDR..need_total]))
+}
+
+#[cfg(test)]
+mod tls_payload_tests {
+    use super::*;
+
+    fn payload_bytes(pl: &TsTlsPlaintextPayload) -> [u8; 40] {
+        // SAFETY: TsTlsPlaintextPayload is repr(C) with no padding holes
+        // exposed, and we read exactly its 40 bytes.
+        unsafe { core::ptr::read_unaligned(pl as *const _ as *const [u8; 40]) }
+    }
+
+    #[test]
+    fn tls_payload_size_is_40() {
+        assert_eq!(size_of::<TsTlsPlaintextPayload>(), 40);
+        assert_eq!(align_of::<TsTlsPlaintextPayload>(), 8);
+    }
+
+    #[test]
+    fn decode_tls_plaintext_round_trip() {
+        let pl = TsTlsPlaintextPayload {
+            ssl_ctx: 0xdead_beef_cafe,
+            call_id: 1_715_073_082_114_000_000,
+            entry_cgroup_id: 12345,
+            total_bytes: 10295,
+            chunk_index: 0,
+            chunk_total: 3,
+            chunk_bytes: 1024,
+            direction: 0,
+            flags: 0,
+            _pad: [0; 4],
+        };
+        let body = vec![0xAB; 1024];
+        let mut buf = Vec::with_capacity(40 + 1024);
+        buf.extend_from_slice(&payload_bytes(&pl));
+        buf.extend_from_slice(&body);
+
+        let (decoded, plaintext) = decode_tls_plaintext(&buf).expect("decode");
+        assert_eq!(decoded.ssl_ctx, pl.ssl_ctx);
+        assert_eq!(decoded.call_id, pl.call_id);
+        assert_eq!(decoded.chunk_bytes, 1024);
+        assert_eq!(plaintext, body.as_slice());
+    }
+
+    #[test]
+    fn decode_tls_plaintext_zero_chunk_bytes_is_empty_slice() {
+        let pl = TsTlsPlaintextPayload {
+            ssl_ctx: 0,
+            call_id: 0,
+            entry_cgroup_id: 0,
+            total_bytes: 0,
+            chunk_index: 0,
+            chunk_total: 1,
+            chunk_bytes: 0,
+            direction: 1,
+            flags: TLS_FLAG_READ_FAILED,
+            _pad: [0; 4],
+        };
+        let buf = payload_bytes(&pl);
+        let (decoded, plaintext) = decode_tls_plaintext(&buf).expect("decode");
+        assert!(plaintext.is_empty());
+        assert!(decoded.flags & TLS_FLAG_READ_FAILED != 0);
+    }
+
+    #[test]
+    fn decode_tls_plaintext_short_buffer_is_truncated_err() {
+        let buf = [0u8; 20];
+        let err = decode_tls_plaintext(&buf).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated { got: 20, need: 40 }));
+    }
+
+    #[test]
+    fn decode_tls_plaintext_bad_length_err() {
+        let pl = TsTlsPlaintextPayload {
+            ssl_ctx: 0,
+            call_id: 0,
+            entry_cgroup_id: 0,
+            total_bytes: 4096,
+            chunk_index: 0,
+            chunk_total: 1,
+            chunk_bytes: 4096,
+            direction: 0,
+            flags: 0,
+            _pad: [0; 4],
+        };
+        let mut buf = Vec::with_capacity(40 + 100);
+        buf.extend_from_slice(&payload_bytes(&pl));
+        buf.extend_from_slice(&[0u8; 100]);
+        let err = decode_tls_plaintext(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::BadLength {
+                declared: 4096,
+                available: 100
+            }
+        ));
+    }
+}

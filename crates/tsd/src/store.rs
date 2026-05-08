@@ -52,6 +52,31 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS events_tls_plaintext (
+    ts_ns           BIGINT  NOT NULL,
+    pid             INTEGER NOT NULL,
+    tgid            INTEGER NOT NULL,
+    cgroup_id       BIGINT  NOT NULL,
+    comm            VARCHAR NOT NULL,
+    ssl_ctx         BIGINT  NOT NULL,
+    call_id         BIGINT  NOT NULL,
+    direction       TINYINT NOT NULL,
+    total_bytes     INTEGER NOT NULL,
+    chunk_index     SMALLINT NOT NULL,
+    chunk_total     SMALLINT NOT NULL,
+    chunk_bytes     SMALLINT NOT NULL,
+    truncated       BOOLEAN NOT NULL,
+    read_failed     BOOLEAN NOT NULL,
+    ex_variant      BOOLEAN NOT NULL,
+    plaintext       BLOB
+);
+
+CREATE INDEX IF NOT EXISTS idx_tls_ts ON events_tls_plaintext(ts_ns);
+CREATE INDEX IF NOT EXISTS idx_tls_call
+    ON events_tls_plaintext(tgid, ssl_ctx, direction, call_id, chunk_index);
+"#;
+
 pub struct Store {
     conn: Connection,
 }
@@ -88,6 +113,14 @@ impl Store {
             self.conn
                 .execute("INSERT INTO schema_version (version) VALUES (1)", [])
                 .context("record schema v1")?;
+        }
+        self.conn
+            .execute_batch(SCHEMA_V2)
+            .context("apply v2 schema")?;
+        if current < 2 {
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (2)", [])
+                .context("record schema v2")?;
         }
         Ok(())
     }
@@ -211,11 +244,12 @@ mod tests {
         assert_eq!(store.count_table("events_proc_exec").unwrap(), 0);
         assert_eq!(store.count_table("events_net_connect").unwrap(), 0);
         assert_eq!(store.count_table("events_net_bytes").unwrap(), 0);
+        assert_eq!(store.count_table("events_tls_plaintext").unwrap(), 0);
         let v: i64 = store
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
     }
 
     #[test]
@@ -225,12 +259,13 @@ mod tests {
         let _store1 = Store::open(&path).expect("first open");
         drop(_store1);
         let _store2 = Store::open(&path).expect("second open");
-        // No panic, no extra schema_version rows beyond what's expected.
+        // No panic, no extra schema_version rows beyond what's expected:
+        // one row per applied migration (v1 + v2 = 2 rows).
         let count: i64 = _store2
             .conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
