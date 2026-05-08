@@ -21,4 +21,8 @@ pub mod net {
     include!(concat!(env!("OUT_DIR"), "/net.skel.rs"));
 }
 
+pub mod tls {
+    include!(concat!(env!("OUT_DIR"), "/tls.skel.rs"));
+}
+
 pub use libbpf_rs;

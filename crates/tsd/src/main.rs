@@ -109,17 +109,21 @@ fn main() -> Result<()> {
         count = tracked_cgroup_ids.len(),
         "tls cgroup filter ids resolved"
     );
-    // bpffs subdir for pinned maps (Task 4 needs this before skel load).
-    if let Err(e) = cgroup::ensure_bpffs_dir() {
-        // Non-fatal in Phase 2.A wiring stage: TLS attach hasn't landed,
-        // so an unwriteable bpffs is a problem only when Task 4 runs.
-        tracing::warn!(error = ?e, dir = cgroup::BPFFS_DIR, "could not create bpffs dir; tls attach will fail until fixed");
-    }
+    // bpffs subdir for pinned maps. Required before TLS skel load
+    // (cgroup_filter is pinned-by-name into this directory). The
+    // daemon needs CAP_SYS_ADMIN to mkdir on bpffs; if this fails,
+    // the TLS skeleton load below will fail too with a clearer error.
+    cgroup::ensure_bpffs_dir().context("create /sys/fs/bpf/tokenscope")?;
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
     let mut storage = SkelStorage::new();
-    let skels = load_all(&mut storage, cgroup_root).context("load skeletons")?;
-    info!(flush_ms = args.flush_interval_ms, "BPF programs attached");
+    let skels = load_all(&mut storage, cgroup_root, &tracked_cgroup_ids)
+        .context("load skeletons")?;
+    info!(
+        flush_ms = args.flush_interval_ms,
+        tls_cgroup_filter_size = tracked_cgroup_ids.len(),
+        "BPF programs attached"
+    );
 
     let cache = RefCell::new(ProcessCache::new());
     let store = Store::open(&args.db_path).context("open DuckDB store")?;

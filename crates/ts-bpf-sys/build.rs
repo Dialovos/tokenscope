@@ -12,6 +12,7 @@ use libbpf_cargo::SkeletonBuilder;
 const PROGRAMS: &[(&str, &str)] = &[
     ("sched_exec.bpf.c", "sched_exec.skel.rs"),
     ("net.bpf.c", "net.skel.rs"),
+    ("tls.bpf.c", "tls.skel.rs"),
 ];
 
 fn main() {
