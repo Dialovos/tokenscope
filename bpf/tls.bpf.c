@@ -87,16 +87,95 @@ static __always_inline bool cgroup_tracked(__u64 cgid) {
     return bpf_map_lookup_elem(&cgroup_filter, &k) != NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Stub probes — Tasks 5-8 fill the bodies. These exist now so the     */
-/* skeleton loads cleanly and the verifier accepts the program shape.  */
-/* ------------------------------------------------------------------ */
+/* The full per-chunk record. Sized so the verifier sees a constant
+ * allocation per loop iteration. Total: 56 (hdr) + 40 (payload) + 4096. */
+struct tls_record {
+    struct ts_event_hdr hdr;
+    struct ts_tls_plaintext_payload pl;
+    __u8 plaintext[CHUNK_BYTES];
+};
+
+/* Chunk a single SSL_* call's plaintext into up to MAX_CHUNKS records.
+ * Each record reserves a constant-size slot in the ringbuf and writes
+ * directly into the ringbuf-resident plaintext buffer (no BPF stack
+ * pressure). Returns 0 on success, -1 on the first reserve failure. */
+static __always_inline int emit_plaintext_chunks(
+    __u64 ssl_ctx, __u64 call_id, __u64 entry_cgid,
+    const void *src, __u32 total_bytes,
+    __u8 direction, __u8 ex_variant)
+{
+    if (total_bytes == 0) return 0;
+    __u32 n_chunks = total_bytes / CHUNK_BYTES + (total_bytes % CHUNK_BYTES ? 1 : 0);
+    __u8 truncated = 0;
+    if (n_chunks > MAX_CHUNKS) {
+        n_chunks = MAX_CHUNKS;
+        truncated = 1;
+    }
+
+    #pragma unroll
+    for (__u32 i = 0; i < MAX_CHUNKS; i++) {
+        if (i >= n_chunks) break;
+
+        __u32 off = i * CHUNK_BYTES;
+        __u32 chunk_bytes = CHUNK_BYTES;
+        if (i + 1 == n_chunks) {
+            __u32 rem = total_bytes - off;
+            chunk_bytes = (rem > CHUNK_BYTES) ? CHUNK_BYTES : rem;
+        }
+        if (chunk_bytes > CHUNK_BYTES) chunk_bytes = CHUNK_BYTES; /* verifier */
+
+        struct tls_record *r = bpf_ringbuf_reserve(&events_tls, sizeof(*r), 0);
+        if (!r) {
+            __u32 zero = 0;
+            __u64 *c = bpf_map_lookup_elem(&tls_reserve_fail, &zero);
+            if (c) __sync_fetch_and_add(c, 1);
+            return -1;
+        }
+
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        r->hdr.ts_ns     = bpf_ktime_get_ns();
+        r->hdr.cpu       = bpf_get_smp_processor_id();
+        r->hdr.pid       = (__u32)(pid_tgid & 0xFFFFFFFFu);
+        r->hdr.tgid      = (__u32)(pid_tgid >> 32);
+        r->hdr.cgroup_id = entry_cgid;
+        r->hdr.type      = TS_TLS_PLAINTEXT;
+        r->hdr.len       = sizeof(struct ts_tls_plaintext_payload) + chunk_bytes;
+        bpf_get_current_comm(&r->hdr.comm, sizeof(r->hdr.comm));
+
+        r->pl.ssl_ctx         = ssl_ctx;
+        r->pl.call_id         = call_id;
+        r->pl.entry_cgroup_id = entry_cgid;
+        r->pl.total_bytes     = total_bytes;
+        r->pl.chunk_index     = (__u16)i;
+        r->pl.chunk_total     = (__u16)n_chunks;
+        r->pl.chunk_bytes     = (__u16)chunk_bytes;
+        r->pl.direction       = direction;
+        r->pl.flags           = (truncated && i + 1 == n_chunks ? TLS_FLAG_TRUNCATED : 0)
+                              | (ex_variant ? TLS_FLAG_EX_VARIANT : 0);
+        __builtin_memset(r->pl._pad, 0, sizeof(r->pl._pad));
+
+        long pr = bpf_probe_read_user(r->plaintext, chunk_bytes,
+                                      (const __u8 *)src + off);
+        if (pr) {
+            r->pl.flags |= TLS_FLAG_READ_FAILED;
+            r->pl.chunk_bytes = 0;
+            __builtin_memset(r->plaintext, 0, CHUNK_BYTES);
+        }
+
+        bpf_ringbuf_submit(r, 0);
+    }
+    return 0;
+}
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(ssl_write_entry, void *ssl, const void *buf, int num)
 {
-    (void)ssl; (void)buf; (void)num;
-    return 0;
+    if (num <= 0) return 0;
+    __u64 cgid = bpf_get_current_cgroup_id();
+    if (!cgroup_tracked(cgid)) return 0;
+    __u64 call_id = bpf_ktime_get_ns();
+    return emit_plaintext_chunks((__u64)ssl, call_id, cgid, buf,
+                                  (__u32)num, 0 /* write */, 0 /* not _ex */);
 }
 
 SEC("uprobe/SSL_write_ex")
