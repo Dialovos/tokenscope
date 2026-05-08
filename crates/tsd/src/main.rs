@@ -32,9 +32,7 @@ use ts_core::{decode_header, decode_net_connect, TsEventType};
 
 use crate::control::{Counters, Subscribers};
 use crate::proc_cache::ProcessCache;
-use crate::sink::{
-    EventEnvelope, EventSink, NetConnectEvent, ProcExecEvent,
-};
+use crate::sink::{EventEnvelope, EventSink, NetConnectEvent, ProcExecEvent};
 use crate::skeletons::{load_all, SkelStorage};
 use crate::store::Store;
 
@@ -232,14 +230,20 @@ fn handle_event(
             // Push to the single-writer sink. `try_send` so a brief
             // backpressure stall in the writer thread can't wedge the
             // ringbuf consumer; the event is dropped on full sink.
-            let _ = events_tx.try_send(EventEnvelope::ProcExec(ProcExecEvent {
-                ts_ns: hdr.ts_ns,
-                pid: hdr.pid,
-                tgid: hdr.tgid,
-                cgroup_id: hdr.cgroup_id,
-                comm,
-                cmdline,
-            }));
+            // Disconnected means the writer thread is shutting down —
+            // don't count those, only Full.
+            if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                events_tx.try_send(EventEnvelope::ProcExec(ProcExecEvent {
+                    ts_ns: hdr.ts_ns,
+                    pid: hdr.pid,
+                    tgid: hdr.tgid,
+                    cgroup_id: hdr.cgroup_id,
+                    comm,
+                    cmdline,
+                }))
+            {
+                counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
+            }
             counters.events_total.fetch_add(1, Ordering::Relaxed);
         }
         Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
@@ -254,18 +258,22 @@ fn handle_event(
                         cgid = hdr.cgroup_id,
                     );
                 }
-                let _ = events_tx.try_send(EventEnvelope::NetConnect(NetConnectEvent {
-                    ts_ns: hdr.ts_ns,
-                    pid: hdr.pid,
-                    tgid: hdr.tgid,
-                    cgroup_id: hdr.cgroup_id,
-                    comm,
-                    cmdline,
-                    dst_addr: pl.dst_addr,
-                    dst_port: pl.dst_port,
-                    family: pl.family,
-                    protocol: pl.protocol,
-                }));
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                    events_tx.try_send(EventEnvelope::NetConnect(NetConnectEvent {
+                        ts_ns: hdr.ts_ns,
+                        pid: hdr.pid,
+                        tgid: hdr.tgid,
+                        cgroup_id: hdr.cgroup_id,
+                        comm,
+                        cmdline,
+                        dst_addr: pl.dst_addr,
+                        dst_port: pl.dst_port,
+                        family: pl.family,
+                        protocol: pl.protocol,
+                    }))
+                {
+                    counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
+                }
                 counters.events_total.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => error!(?e, "decode net_connect failed"),

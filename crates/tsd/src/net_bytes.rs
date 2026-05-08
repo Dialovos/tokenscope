@@ -55,19 +55,23 @@ pub fn flush(
                 ns = value.last_ns,
             );
         }
-        // Drop on full sink — Counters tracks tail-side losses; this
-        // path's losses are budgeted into the same producer-side
-        // backpressure semantics as the ringbuf consumer.
-        let _ = events_tx.try_send(EventEnvelope::NetBytesSnapshot(NetBytesSnapshot {
-            snapshot_ts_ns: snapshot,
-            sock_cookie: key.sock_cookie,
-            pid: value.pid,
-            comm,
-            cmdline,
-            tx_bytes: value.tx_bytes,
-            rx_bytes: value.rx_bytes,
-            last_event_ns: value.last_ns,
-        }));
+        // Drop on full sink — bump `sink_dropped_events` so backpressure
+        // from a stalled writer thread is observable via tsctl status.
+        // Disconnected means the writer is shutting down; don't count.
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+            events_tx.try_send(EventEnvelope::NetBytesSnapshot(NetBytesSnapshot {
+                snapshot_ts_ns: snapshot,
+                sock_cookie: key.sock_cookie,
+                pid: value.pid,
+                comm,
+                cmdline,
+                tx_bytes: value.tx_bytes,
+                rx_bytes: value.rx_bytes,
+                last_event_ns: value.last_ns,
+            }))
+        {
+            counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
         counters.events_total.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -27,7 +27,9 @@ pub enum Request {
         #[serde(default)]
         include_plaintext: bool,
     },
-    Query { sql: String },
+    Query {
+        sql: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,8 +153,7 @@ mod tests {
 
     #[test]
     fn tail_request_explicit_include_plaintext_true() {
-        let r: Request =
-            serde_json::from_str(r#"{"op":"tail","include_plaintext":true}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"tail","include_plaintext":true}"#).unwrap();
         match r {
             Request::Tail { include_plaintext } => assert!(include_plaintext),
             _ => panic!("wrong variant"),

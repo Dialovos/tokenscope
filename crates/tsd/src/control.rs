@@ -56,6 +56,11 @@ pub struct Counters {
     /// full when `broadcast`/`broadcast_envelope` tried to push.
     /// Used by tsctl status / Phase 2.A tail-loss visibility.
     pub tail_dropped_events: AtomicU64,
+    /// Producer-side drops at the single-writer sink: bumped when a
+    /// `try_send` onto `events_tx` returns `TrySendError::Full`. Distinct
+    /// from `tail_dropped_events`, which counts subscriber-side drops.
+    /// Surfaced by tsctl status as the writer-thread backpressure signal.
+    pub sink_dropped_events: AtomicU64,
 }
 
 /// Per-subscriber state. Holds the bounded sender plus the rendering
@@ -175,17 +180,14 @@ impl Drop for SubscriberGuard {
     }
 }
 
-/// Phase 2.A interim renderer: serialize each `EventEnvelope` into a
-/// minimal hand-built JSON shape. Per-subscriber plaintext gating
-/// lands in Task 11; for the refactor pass we just emit the
-/// envelope-shaped fields. The historical wire shape (the
-/// `TailEvent` JSON) is still emitted by the legacy `broadcast`
-/// callers in `main.rs` / `net_bytes.rs` until those move onto the
-/// envelope path in later tasks.
-pub fn render_tail_line(
-    env: &crate::sink::EventEnvelope,
-    _include_plaintext: bool,
-) -> String {
+/// Render an `EventEnvelope` as a one-line JSON string for tsctl tail.
+///
+/// Phase 2.A interim shape — Task 11 replaces this with a full renderer
+/// that respects `include_plaintext` per subscriber and applies redaction.
+/// Until then, all four envelope variants render to a minimal JSON line
+/// (no plaintext bytes are present in any envelope yet) and the bool
+/// argument is unused.
+pub fn render_tail_line(env: &crate::sink::EventEnvelope, _include_plaintext: bool) -> String {
     match env {
         crate::sink::EventEnvelope::ProcExec(e) => {
             format!(

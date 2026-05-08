@@ -157,14 +157,9 @@ fn writer_loop(
 
 fn persist(store: &Store, env: &EventEnvelope) -> Result<()> {
     match env {
-        EventEnvelope::ProcExec(e) => store.insert_proc_exec(
-            e.ts_ns,
-            e.pid,
-            e.tgid,
-            e.cgroup_id,
-            &e.comm,
-            &e.cmdline,
-        ),
+        EventEnvelope::ProcExec(e) => {
+            store.insert_proc_exec(e.ts_ns, e.pid, e.tgid, e.cgroup_id, &e.comm, &e.cmdline)
+        }
         EventEnvelope::NetConnect(e) => store.insert_net_connect(
             e.ts_ns,
             e.pid,
@@ -192,5 +187,33 @@ fn persist(store: &Store, env: &EventEnvelope) -> Result<()> {
             // so the refactor lands without a TLS table.
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::Counters;
+
+    #[test]
+    fn sink_dropped_counter_works_with_capacity() {
+        // Direct unit test of the counter bump pattern: simulate a
+        // try_send-on-full by filling a small channel.
+        use std::sync::mpsc::{sync_channel, TrySendError};
+        let counters = Arc::new(Counters::default());
+        let (tx, _rx) = sync_channel::<u32>(1);
+        tx.try_send(1).unwrap(); // fills capacity
+        let res = tx.try_send(2); // would block → Full
+        if let Err(TrySendError::Full(_)) = res {
+            counters
+                .sink_dropped_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(
+            counters
+                .sink_dropped_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
