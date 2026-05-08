@@ -24,6 +24,43 @@ BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool
 
 ## Phases
 
+### Phase 2.A — TLS Plaintext Capture (shipped 2026-05-08, tag `v0.0.9-phase2a`)
+
+`tsd` now captures decrypted TLS plaintext from any process that loads a shared `libssl.so.*`. The pipeline is fully wired end-to-end: a new `bpf/tls.bpf.c` declares uprobes on `SSL_write{,_ex}` (entry) and `SSL_read{,_ex}` (entry stash + uretprobe drain), with the read-side keyed by full kernel `pid_tgid` so threads in the same process can call SSL_read concurrently without aliasing (codex BLOCKING #2). Each call's plaintext is chunked into ≤ 16 records of 4 KiB each; the last record carries `truncated=1` if the call exceeded 64 KiB. The ringbuf is 4 MiB so several max-size calls can land before backpressure (codex BLOCKING #7).
+
+Userspace lives in `crates/tsd/src/tls.rs`. A periodic `discovery_tick` (5s) walks `/proc/*/maps`, resolves visible paths via `/proc/<pid>/root/...` so containers + symlink-replaced libs work, keys an `attached: HashMap<(dev, ino), AttachedLib>` so the same physical inode never gets duplicate uprobes (codex BLOCKING #5), and attaches all four probe pairs per binary (`_ex` variants are best-effort; missing symbols bump `tls_libs_partial_attach`). `handle_tls_record` decodes each `events_tls` ringbuf frame, wraps it as `EventEnvelope::TlsPlaintext`, and pushes onto the single-writer sink channel introduced by Task 1's refactor. The DuckDB writer thread persists via the `Appender` API (Task 10) — TLS rates are bursty enough that single-row INSERTs would be a throughput cliff. Records flush every ~1s on idle ticks plus once on shutdown.
+
+`tsctl tail` rendering became per-subscriber (codex BLOCKING #6 — the previous broadcast model would have leaked plaintext to every subscriber regardless of their `--show-plaintext` flag). `Request::Tail` now carries `include_plaintext: bool` (serde default false → backward compatible with old tsctl). The daemon renders per subscriber via `render_tail_line`; each TLS record always emits a 4-byte `plaintext_sha256` prefix (so dedupe / replay-detection works without seeing content), and only includes `plaintext_b64` for subscribers that opted in. Server-side redaction passes through the bytes before encoding: 13 patterns covering Authorization/X-API-Key/Bearer headers + provider-specific token shapes (Anthropic, OpenAI, Groq, HuggingFace, Google, GitHub, GitLab, AWS) + JWTs + PEM private key blocks. The stored DuckDB BLOB keeps full fidelity for downstream parsers (Phase 2.C).
+
+`tsctl status` now surfaces 13 new counters: `tls_libs_attached/skipped/partial_attach`, `tls_records_emitted`, `tls_truncated_calls`, `tls_read_failed_chunks`, `tls_inflight_collisions`, `tls_reserve_failures`, `tls_scan_duration_us`, `tls_scan_errors`, `tls_subscribers_with_plaintext`, plus the foundational `tail_dropped_events` and `sink_dropped_events` introduced by Task 1. The TLS percpu counters (`tls_reserve_fail`, `tls_inflight_collision`) are pumped from BPF into userspace once per discovery scan via `Map::lookup_percpu`.
+
+The architecture refactor done in Task 1 is itself a Phase 2.A deliverable: the Phase 1 direct-call sink (consumers calling `Store::insert_*` and `Subscribers::broadcast` inline) was replaced with a `EventEnvelope` enum + `events_tx: SyncSender<EventEnvelope>` channel + a single `store-writer` thread (`crates/tsd/src/sink.rs`) that owns the DuckDB `Connection` by value. The plan's `Arc<Store>` shape didn't compile because `duckdb::Connection` is `Send + !Sync`; moving `Store` by value into the writer thread keeps single-writer DuckDB semantics with deterministic shutdown via `EventSink::Drop`.
+
+A second design pivot landed on Task 9: the plan called for separate discovery + ringbuf-consumer threads, but libbpf-rs's `Program` and `Map` types are neither `Send` nor `Sync`, so cross-thread borrows of the loaded skeleton would not compile. Single-thread design instead — the existing main loop polls `events_tls` (added to its existing `RingBufferBuilder`) and calls `discovery_tick` once per iteration; the tick is a no-op until its 5s deadline.
+
+**Codex second-opinion review** (read-only pass on the spec) caught **8 BLOCKING + 10 SHOULD-FIX** items before any code was written: payload alignment (the original 20-byte struct was actually 24 with natural padding; now explicitly 40 with `call_id` + `entry_cgroup_id`), `tgid` keying collisions across threads, `ssl_ctx` alone insufficient as a stream id (composite key `(tgid, ssl_ctx, direction, call_id)` instead), `/proc/maps` path identity broken under containers, broadcast model leaks plaintext, ringbuf undersized, single-writer DuckDB violated, cgroup_filter map sharing underspecified — all folded into the spec at `docs/superpowers/specs/2026-05-07-phase-2a-tls-uprobe-design.md` (commit `bc2f40c`).
+
+**Gate evidence (verified 2026-05-08):**
+- `cargo build -p tsd` clean (compiles `bpf/tls.bpf.c` via libbpf-cargo + the new `-D__TARGET_ARCH_x86` clang flag)
+- `cargo test -p ts-core` — 32 unit tests pass (27 prior + 5 TLS payload round-trip + decode-error)
+- `cargo test -p tsd --bin tsd` — 35 unit tests pass (22 prior + cgroup helpers 2 + tls regex/discovery 2 + redact 5 + render_tail 3 + sink 1)
+- `sudo -E cargo test -p tsd --test tls_e2e -- --ignored` — 3 integration tests behind `#[ignore]` (curl-driven; require CAP_BPF + network):
+  - `tls_attaches_to_libssl_within_one_rescan`: tsd discovers + attaches to the test binary's libssl mapping (pulled in via duckdb→reqwest→openssl-sys) within 15s
+  - `tls_curl_emits_chunks_and_rows_in_db`: spawns curl https://example.com, asserts `events_tls_plaintext` has rows in both directions after the Appender's 1s flush
+  - `tls_default_tail_does_not_leak_authorization_header`: regression guard for codex BLOCKING #6 — drives curl with a magic Bearer token, asserts default `tsctl tail` (no `--show-plaintext`) doesn't leak it
+- Spec: `docs/superpowers/specs/2026-05-07-phase-2a-tls-uprobe-design.md`
+- Plan: `docs/superpowers/plans/2026-05-07-phase-2a-tls-uprobe.md`
+
+**Known gaps (deferred):**
+- Go binaries (static `crypto/tls`) — invisible. Future phase (gobpf-style runtime offset discovery)
+- Rust binaries using `rustls` — invisible. Future phase (FFI-surface uprobes or kTLS sniffing)
+- BoringSSL with stripped/non-standard symbols (Chrome, Electron) — counted as `tls_libs_skipped`
+- Statically-linked OpenSSL into a binary — discovery only walks shared library mappings
+- `SSL_write` captures *attempted* bytes, not necessarily transmitted (if the underlying socket write fails, the plaintext is still recorded)
+- Per-cgroup `tsctl cgroup add/remove` UX — current shape is `--track-cgroup PATH` (repeatable) at tsd startup; the daemon's own cgroup is always seeded
+- Min kernel **5.15** (uprobe MEM_RINGBUF dest writes stable). Older kernels reject at skeleton load
+- HTTP framing reassembly across `SSL_*` calls is Phase 2.B; provider-specific parsers (Anthropic, OpenAI, Ollama) + cost calc are Phase 2.C; `tstop` TUI v1 is Phase 2.D
+
 ### Phase 1.G — tsctl Query (shipped 2026-05-07, tag `v0.0.8-phase1g`)
 
 `tsctl query <SQL>` ships, completing the Phase 1 user-visible surface. The daemon executes each query in a worker thread that opens an **in-memory** DuckDB primary and `ATTACH '…events.duckdb' AS data (READ_ONLY)` — DuckDB's read-only attach is the designed-for path for "let other tools query my live database file without taking a write lock", and the engine itself rejects any INSERT/UPDATE/DELETE/DDL against an RO-attached database (verified end-to-end: `Cannot execute statement of type "DELETE" on database "data" which is attached in read-only mode!`). SELECT/WITH/VALUES queries are wrapped as `SELECT * FROM (<user_sql>) LIMIT 100000` so a giant result can't materialize before the row counter notices.
