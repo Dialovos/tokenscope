@@ -64,6 +64,11 @@ struct Args {
     /// Skip starting the control-plane listener.
     #[arg(long)]
     no_control: bool,
+
+    /// Cgroup paths to track for TLS uprobes (Phase 2.A). Repeatable.
+    /// The daemon's own cgroup is always included; this flag adds others.
+    #[arg(long, value_name = "PATH")]
+    track_cgroup: Vec<PathBuf>,
 }
 
 fn default_db_path() -> PathBuf {
@@ -84,9 +89,32 @@ fn main() -> Result<()> {
         .init();
 
     info!(
-        "tsd starting (Phase 1.F — sched_exec + cgroup/connect + tcp bytes + DuckDB + UDS control)"
+        "tsd starting (Phase 2.A — sched_exec + cgroup/connect + tcp bytes + DuckDB + UDS control + TLS uprobes wiring)"
     );
     info!(db_path = %args.db_path.display(), "opening store");
+
+    // Resolve the cgroup ids that TLS uprobes (Task 4 onward) will be
+    // scoped to: always the daemon's own cgroup, plus anything passed
+    // via --track-cgroup. Failure here is fatal because TLS attach
+    // can't sensibly proceed without a non-empty filter set.
+    let mut tracked_cgroup_ids: Vec<u64> = Vec::with_capacity(1 + args.track_cgroup.len());
+    tracked_cgroup_ids.push(cgroup::own_cgroup_id().context("resolve own cgroup id")?);
+    for path in &args.track_cgroup {
+        tracked_cgroup_ids.push(
+            cgroup::cgroup_path_id(path)
+                .with_context(|| format!("resolve --track-cgroup {}", path.display()))?,
+        );
+    }
+    info!(
+        count = tracked_cgroup_ids.len(),
+        "tls cgroup filter ids resolved"
+    );
+    // bpffs subdir for pinned maps (Task 4 needs this before skel load).
+    if let Err(e) = cgroup::ensure_bpffs_dir() {
+        // Non-fatal in Phase 2.A wiring stage: TLS attach hasn't landed,
+        // so an unwriteable bpffs is a problem only when Task 4 runs.
+        tracing::warn!(error = ?e, dir = cgroup::BPFFS_DIR, "could not create bpffs dir; tls attach will fail until fixed");
+    }
 
     let cgroup_root = cgroup::open_unified_root().context("open cgroup root")?;
     let mut storage = SkelStorage::new();
