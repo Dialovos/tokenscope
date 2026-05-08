@@ -112,7 +112,7 @@ static __always_inline int emit_plaintext_chunks(
         truncated = 1;
     }
 
-    #pragma unroll
+    #pragma clang loop unroll(full)
     for (__u32 i = 0; i < MAX_CHUNKS; i++) {
         if (i >= n_chunks) break;
 
@@ -157,9 +157,12 @@ static __always_inline int emit_plaintext_chunks(
         long pr = bpf_probe_read_user(r->plaintext, chunk_bytes,
                                       (const __u8 *)src + off);
         if (pr) {
+            /* Read failed: don't bother zeroing the (4 KiB, ringbuf-
+             * resident) buffer — verifier rejects __builtin_memset on
+             * a buffer this large, and chunk_bytes=0 tells userspace
+             * not to read past the empty plaintext slice. */
             r->pl.flags |= TLS_FLAG_READ_FAILED;
             r->pl.chunk_bytes = 0;
-            __builtin_memset(r->plaintext, 0, CHUNK_BYTES);
         }
 
         bpf_ringbuf_submit(r, 0);

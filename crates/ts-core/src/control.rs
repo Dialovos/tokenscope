@@ -207,10 +207,46 @@ mod tests {
             events_total: 100,
             ringbuf_poll_errors: 0,
             tail_subscribers_active: 2,
+            // Phase 2.A counters — exercise non-default values so the
+            // round trip catches any missing #[serde] attribute.
+            tail_dropped_events: 1,
+            sink_dropped_events: 2,
+            tls_libs_attached: 3,
+            tls_libs_skipped: 0,
+            tls_libs_partial_attach: 0,
+            tls_records_emitted: 99,
+            tls_truncated_calls: 0,
+            tls_read_failed_chunks: 0,
+            tls_inflight_collisions: 0,
+            tls_reserve_failures: 0,
+            tls_scan_duration_us: 4321,
+            tls_scan_errors: 0,
+            tls_subscribers_with_plaintext: 1,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: StatusResponse = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn status_response_old_wire_format_decodes_with_defaults() {
+        // Simulate an old tsd that doesn't know about Phase 2.A fields.
+        // #[serde(default)] should fill them in as zero so a new tsctl
+        // talking to an old daemon doesn't blow up.
+        let json = r#"{
+            "protocol_version": 1,
+            "version": "0.0.8",
+            "uptime_s": 1,
+            "db_path": "/x",
+            "uds_path": "/y",
+            "probes_attached": [],
+            "events_total": 0,
+            "ringbuf_poll_errors": 0,
+            "tail_subscribers_active": 0
+        }"#;
+        let r: StatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.tls_libs_attached, 0);
+        assert_eq!(r.tail_dropped_events, 0);
     }
 
     #[test]

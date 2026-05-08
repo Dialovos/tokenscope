@@ -29,9 +29,15 @@ fn main() {
 
         println!("cargo:rerun-if-changed={}", src.display());
 
+        // __TARGET_ARCH_<arch> is needed by libbpf's bpf_tracing.h
+        // when programs use BPF_UPROBE / BPF_KPROBE / BPF_URETPROBE
+        // (those macros expand to PT_REGS_PARM*, which are arch-gated).
+        // libbpf-cargo doesn't set this automatically. Hard-code x86_64
+        // for now; revisit when we add aarch64 support.
+        let arch_define = "-D__TARGET_ARCH_x86";
         SkeletonBuilder::new()
             .source(&src)
-            .clang_args(["-I", bpf_dir.to_str().unwrap()])
+            .clang_args(["-I", bpf_dir.to_str().unwrap(), arch_define])
             .build_and_generate(&skel)
             .unwrap_or_else(|e| {
                 panic!("failed to build BPF skeleton for {}: {e}", src.display());
