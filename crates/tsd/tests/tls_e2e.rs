@@ -296,7 +296,7 @@ fn tls_default_tail_does_not_leak_authorization_header() {
     // Open `tsctl tail` (NO --show-plaintext) and capture stdout.
     let tail_uds = uds.clone();
     let tail_handle = thread::spawn(move || {
-        let mut tail = Command::new(tsctl_bin())
+        let tail = Command::new(tsctl_bin())
             .args(["--uds-path", tail_uds.to_str().unwrap(), "tail"])
             .stdout(Stdio::piped())
             .spawn()
