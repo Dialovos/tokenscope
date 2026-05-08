@@ -579,6 +579,21 @@ fn handle_conn(
                 events_total: counters.events_total.load(Ordering::Relaxed),
                 ringbuf_poll_errors: counters.ringbuf_poll_errors.load(Ordering::Relaxed),
                 tail_subscribers_active: counters.tail_subscribers_active.load(Ordering::Relaxed),
+                tail_dropped_events: counters.tail_dropped_events.load(Ordering::Relaxed),
+                sink_dropped_events: counters.sink_dropped_events.load(Ordering::Relaxed),
+                tls_libs_attached: counters.tls_libs_attached.load(Ordering::Relaxed),
+                tls_libs_skipped: counters.tls_libs_skipped.load(Ordering::Relaxed),
+                tls_libs_partial_attach: counters.tls_libs_partial_attach.load(Ordering::Relaxed),
+                tls_records_emitted: counters.tls_records_emitted.load(Ordering::Relaxed),
+                tls_truncated_calls: counters.tls_truncated_calls.load(Ordering::Relaxed),
+                tls_read_failed_chunks: counters.tls_read_failed_chunks.load(Ordering::Relaxed),
+                tls_inflight_collisions: counters.tls_inflight_collisions.load(Ordering::Relaxed),
+                tls_reserve_failures: counters.tls_reserve_failures.load(Ordering::Relaxed),
+                tls_scan_duration_us: counters.tls_scan_duration_us.load(Ordering::Relaxed),
+                tls_scan_errors: counters.tls_scan_errors.load(Ordering::Relaxed),
+                tls_subscribers_with_plaintext: counters
+                    .tls_subscribers_with_plaintext
+                    .load(Ordering::Relaxed),
             };
             let json = serde_json::to_string(&resp).unwrap_or_default();
             let _ = writeln!(writer, "{json}");
@@ -625,6 +640,15 @@ fn probes_attached() -> Vec<String> {
         "cgroup_connect6".into(),
         "tcp_sendmsg".into(),
         "tcp_recvmsg".into(),
+        // TLS probes are attached lazily per libssl.so by tls.rs;
+        // listed here so tsctl status shows the program-load set, not
+        // the current attach count (which is in tls_libs_attached).
+        "uprobe_SSL_write".into(),
+        "uprobe_SSL_write_ex".into(),
+        "uprobe_SSL_read".into(),
+        "uretprobe_SSL_read".into(),
+        "uprobe_SSL_read_ex".into(),
+        "uretprobe_SSL_read_ex".into(),
     ]
 }
 

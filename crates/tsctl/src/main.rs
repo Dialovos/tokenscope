@@ -105,6 +105,19 @@ fn cmd_status(uds_path: &PathBuf) -> Result<()> {
     println!("events total           {}", resp.events_total);
     println!("ringbuf poll errors    {}", resp.ringbuf_poll_errors);
     println!("tail subscribers       {}", resp.tail_subscribers_active);
+    println!("tail dropped events    {}", resp.tail_dropped_events);
+    println!("sink dropped events    {}", resp.sink_dropped_events);
+    println!("tls libs attached      {}", resp.tls_libs_attached);
+    println!("tls libs skipped       {}", resp.tls_libs_skipped);
+    println!("tls libs partial       {}", resp.tls_libs_partial_attach);
+    println!("tls records emitted    {}", resp.tls_records_emitted);
+    println!("tls truncated calls    {}", resp.tls_truncated_calls);
+    println!("tls read failed chunks {}", resp.tls_read_failed_chunks);
+    println!("tls inflight collisions {}", resp.tls_inflight_collisions);
+    println!("tls reserve failures   {}", resp.tls_reserve_failures);
+    println!("tls scan duration (us) {}", resp.tls_scan_duration_us);
+    println!("tls scan errors        {}", resp.tls_scan_errors);
+    println!("tls subs w/ plaintext  {}", resp.tls_subscribers_with_plaintext);
     Ok(())
 }
 

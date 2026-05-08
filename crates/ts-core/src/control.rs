@@ -46,6 +46,35 @@ pub struct StatusResponse {
     /// Phase 2.
     pub ringbuf_poll_errors: u64,
     pub tail_subscribers_active: u32,
+
+    // ---- Phase 2.A counters. #[serde(default)] keeps a new tsctl
+    //      talking to an old tsd from blowing up on missing fields. ----
+    #[serde(default)]
+    pub tail_dropped_events: u64,
+    #[serde(default)]
+    pub sink_dropped_events: u64,
+    #[serde(default)]
+    pub tls_libs_attached: u32,
+    #[serde(default)]
+    pub tls_libs_skipped: u32,
+    #[serde(default)]
+    pub tls_libs_partial_attach: u32,
+    #[serde(default)]
+    pub tls_records_emitted: u64,
+    #[serde(default)]
+    pub tls_truncated_calls: u64,
+    #[serde(default)]
+    pub tls_read_failed_chunks: u64,
+    #[serde(default)]
+    pub tls_inflight_collisions: u64,
+    #[serde(default)]
+    pub tls_reserve_failures: u64,
+    #[serde(default)]
+    pub tls_scan_duration_us: u64,
+    #[serde(default)]
+    pub tls_scan_errors: u32,
+    #[serde(default)]
+    pub tls_subscribers_with_plaintext: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
