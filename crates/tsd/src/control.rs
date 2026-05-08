@@ -204,43 +204,155 @@ impl Drop for SubscriberGuard {
     }
 }
 
+use std::sync::OnceLock;
+
+use base64::Engine as _;
+use regex::Regex;
+use sha2::{Digest, Sha256};
+
+/// Compiled-once redaction patterns. Match left-to-right; each match
+/// is replaced with `***REDACTED***` (the header-style first pattern
+/// preserves the captured header name). Server-side only — the BLOB
+/// stored in DuckDB keeps full fidelity (codex BLOCKING #6: never
+/// trust the client to redact, even on opt-in).
+fn redactors() -> &'static [Regex] {
+    static R: OnceLock<Vec<Regex>> = OnceLock::new();
+    R.get_or_init(|| {
+        vec![
+            // Header-style assignment (Authorization: ..., x-api-key=..., etc.)
+            Regex::new(
+                r"(?i)\b(authorization|x-api-key|api-key|x-auth-token|x-goog-api-key|api[-_]?key|password|secret|token|client[-_]?secret)\s*[:=]\s*\S+",
+            )
+            .unwrap(),
+            // Anthropic
+            Regex::new(r"\bsk-ant-[\w-]{20,}\b").unwrap(),
+            // OpenAI (sk-..., sk-proj-..., etc.)
+            Regex::new(r"\bsk-[A-Za-z0-9-]{20,}\b").unwrap(),
+            // Groq
+            Regex::new(r"\bgsk_[\w]{20,}\b").unwrap(),
+            // HuggingFace
+            Regex::new(r"\bhf_[\w]{20,}\b").unwrap(),
+            // Google API key
+            Regex::new(r"\bAIza[\w-]{30,}\b").unwrap(),
+            // GitHub PATs
+            Regex::new(r"\bgithub_pat_[\w]{20,}\b").unwrap(),
+            Regex::new(r"\bgh[pousr]_[\w]{20,}\b").unwrap(),
+            // GitLab PATs
+            Regex::new(r"\bglpat-[\w-]{20,}\b").unwrap(),
+            // AWS access keys (long-lived + STS)
+            Regex::new(r"\bAKIA[A-Z0-9]{16}\b").unwrap(),
+            Regex::new(r"\bASIA[A-Z0-9]{16}\b").unwrap(),
+            // JWTs
+            Regex::new(r"\beyJ[\w-]+\.[\w-]+\.[\w-]+\b").unwrap(),
+            // PEM private keys (multi-line block)
+            Regex::new(
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            )
+            .unwrap(),
+        ]
+    })
+}
+
+/// Apply every redaction pattern in order. The first regex (header
+/// assignment) keeps the header name visible by capturing it; all
+/// other patterns replace the whole match with `***REDACTED***`.
+pub fn redact(input: &str) -> String {
+    let res = redactors();
+    let mut out = res[0]
+        .replace_all(input, "$1: ***REDACTED***")
+        .into_owned();
+    for re in &res[1..] {
+        out = re.replace_all(&out, "***REDACTED***").into_owned();
+    }
+    out
+}
+
+fn sha256_prefix_8(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    let digest = h.finalize();
+    // First 4 bytes → 8 hex chars.
+    let mut s = String::with_capacity(8);
+    for b in &digest[..4] {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Render an `EventEnvelope` as a one-line JSON string for tsctl tail.
 ///
-/// Phase 2.A interim shape — Task 11 replaces this with a full renderer
-/// that respects `include_plaintext` per subscriber and applies redaction.
-/// Until then, all four envelope variants render to a minimal JSON line
-/// (no plaintext bytes are present in any envelope yet) and the bool
-/// argument is unused.
-pub fn render_tail_line(env: &crate::sink::EventEnvelope, _include_plaintext: bool) -> String {
+/// For `TlsPlaintext`:
+/// - `plaintext_sha256` is always present (4-byte prefix → 8 hex chars)
+///   so subscribers can dedupe / spot replays without seeing content.
+/// - `plaintext_b64` is present **only** when the subscriber opted into
+///   `include_plaintext` at handshake time. The bytes are passed through
+///   `redact` first so common API-key shapes never reach a tail viewer
+///   in cleartext (codex BLOCKING #6 — server-side enforcement).
+pub fn render_tail_line(env: &crate::sink::EventEnvelope, include_plaintext: bool) -> String {
+    use crate::sink::EventEnvelope::*;
     match env {
-        crate::sink::EventEnvelope::ProcExec(e) => {
-            format!(
-                r#"{{"kind":"proc.exec","ts_ns":{},"pid":{},"comm":"{}"}}"#,
-                e.ts_ns,
-                e.pid,
-                e.comm.escape_default()
-            )
-        }
-        crate::sink::EventEnvelope::NetConnect(e) => {
-            format!(
-                r#"{{"kind":"net.connect","ts_ns":{},"pid":{},"dst_port":{}}}"#,
-                e.ts_ns, e.pid, e.dst_port
-            )
-        }
-        crate::sink::EventEnvelope::NetBytesSnapshot(e) => {
-            format!(
-                r#"{{"kind":"net.bytes","snapshot_ts_ns":{},"sock_cookie":{},"tx":{},"rx":{}}}"#,
-                e.snapshot_ts_ns, e.sock_cookie, e.tx_bytes, e.rx_bytes
-            )
-        }
-        crate::sink::EventEnvelope::TlsPlaintext(e) => {
-            format!(
-                r#"{{"kind":"tls.{dir}","ts_ns":{ts},"pid":{pid},"chunk":{ci}}}"#,
-                dir = if e.direction == 0 { "write" } else { "read" },
-                ts = e.ts_ns,
-                pid = e.pid,
-                ci = e.chunk_index
-            )
+        ProcExec(e) => serde_json::json!({
+            "kind": "proc.exec",
+            "ts_ns": e.ts_ns,
+            "pid": e.pid,
+            "tgid": e.tgid,
+            "cgroup_id": e.cgroup_id,
+            "comm": e.comm,
+        })
+        .to_string(),
+        NetConnect(e) => serde_json::json!({
+            "kind": "net.connect",
+            "ts_ns": e.ts_ns,
+            "pid": e.pid,
+            "tgid": e.tgid,
+            "comm": e.comm,
+            "dst_port": e.dst_port,
+            "family": e.family,
+            "protocol": e.protocol,
+        })
+        .to_string(),
+        NetBytesSnapshot(e) => serde_json::json!({
+            "kind": "net.bytes",
+            "snapshot_ts_ns": e.snapshot_ts_ns,
+            "sock_cookie": e.sock_cookie,
+            "tx": e.tx_bytes,
+            "rx": e.rx_bytes,
+        })
+        .to_string(),
+        TlsPlaintext(e) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".into(),
+                serde_json::Value::String(if e.direction == 0 {
+                    "tls.write".into()
+                } else {
+                    "tls.read".into()
+                }),
+            );
+            obj.insert("ts_ns".into(), e.ts_ns.into());
+            obj.insert("pid".into(), e.pid.into());
+            obj.insert("tgid".into(), e.tgid.into());
+            obj.insert("comm".into(), e.comm.clone().into());
+            obj.insert("ssl_ctx".into(), format!("0x{:x}", e.ssl_ctx).into());
+            obj.insert("call_id".into(), e.call_id.into());
+            obj.insert("total_bytes".into(), e.total_bytes.into());
+            obj.insert("chunk_index".into(), e.chunk_index.into());
+            obj.insert("chunk_total".into(), e.chunk_total.into());
+            obj.insert("chunk_bytes".into(), e.chunk_bytes.into());
+            obj.insert("truncated".into(), e.truncated.into());
+            obj.insert("ex_variant".into(), e.ex_variant.into());
+            obj.insert(
+                "plaintext_sha256".into(),
+                sha256_prefix_8(&e.plaintext).into(),
+            );
+            if include_plaintext && !e.plaintext.is_empty() {
+                let rendered = String::from_utf8_lossy(&e.plaintext).into_owned();
+                let redacted = redact(&rendered);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(redacted.as_bytes());
+                obj.insert("plaintext_b64".into(), b64.into());
+            }
+            serde_json::Value::Object(obj).to_string()
         }
     }
 }
@@ -848,6 +960,103 @@ fn handle_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::{EventEnvelope, TlsPlaintextEvent};
+
+    #[test]
+    fn redact_authorization_bearer() {
+        let s = "Authorization: Bearer sk-ant-abcdefghij1234567890klmnop";
+        let out = redact(s);
+        assert!(out.contains("***REDACTED***"), "{out}");
+        assert!(!out.contains("sk-ant-abc"), "{out}");
+        assert!(out.contains("Authorization"), "{out}");
+    }
+
+    #[test]
+    fn redact_openai_key_in_body() {
+        let s = r#"{"key":"sk-proj-AAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        let out = redact(s);
+        assert!(out.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn redact_aws_access_key() {
+        let s = "AKIAIOSFODNN7EXAMPLE";
+        let out = redact(s);
+        assert_eq!(out, "***REDACTED***");
+    }
+
+    #[test]
+    fn redact_jwt() {
+        let s = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.abc-_123";
+        let out = redact(s);
+        assert!(out.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn redact_passes_through_safe_text() {
+        let s = "hello world this is fine";
+        assert_eq!(redact(s), s);
+    }
+
+    fn make_tls_event(plaintext: Vec<u8>, dir: u8) -> EventEnvelope {
+        EventEnvelope::TlsPlaintext(TlsPlaintextEvent {
+            ts_ns: 1,
+            pid: 2,
+            tgid: 2,
+            cgroup_id: 3,
+            comm: "p".into(),
+            ssl_ctx: 0x1234,
+            call_id: 9,
+            direction: dir,
+            total_bytes: plaintext.len() as u32,
+            chunk_index: 0,
+            chunk_total: 1,
+            chunk_bytes: plaintext.len() as u16,
+            truncated: false,
+            read_failed: false,
+            ex_variant: false,
+            plaintext,
+        })
+    }
+
+    #[test]
+    fn render_tail_tls_default_omits_plaintext_b64() {
+        let evt = make_tls_event(b"hello".to_vec(), 0);
+        let line = render_tail_line(&evt, false);
+        assert!(!line.contains("plaintext_b64"), "leak: {line}");
+        assert!(line.contains("plaintext_sha256"), "{line}");
+        assert!(line.contains("\"kind\":\"tls.write\""), "{line}");
+    }
+
+    #[test]
+    fn render_tail_tls_show_plaintext_includes_b64_and_redacts() {
+        let body = b"Authorization: Bearer sk-ant-XXXXXXXXXXXXXXXXXXXXXXX\nbody".to_vec();
+        let evt = make_tls_event(body, 0);
+        let line = render_tail_line(&evt, true);
+        assert!(line.contains("plaintext_b64"), "{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let b64 = v["plaintext_b64"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let s = String::from_utf8_lossy(&decoded);
+        assert!(s.contains("***REDACTED***"), "redaction missing: {s}");
+        assert!(!s.contains("sk-ant-XXX"), "leak in b64: {s}");
+    }
+
+    #[test]
+    fn render_tail_proc_exec_is_valid_json() {
+        let evt = EventEnvelope::ProcExec(crate::sink::ProcExecEvent {
+            ts_ns: 1,
+            pid: 2,
+            tgid: 2,
+            cgroup_id: 3,
+            comm: "x".into(),
+            cmdline: "x --y".into(),
+        });
+        let line = render_tail_line(&evt, false);
+        let _: serde_json::Value = serde_json::from_str(&line).unwrap();
+    }
 
     #[test]
     fn wrap_select_adds_limit() {

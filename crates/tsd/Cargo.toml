@@ -24,6 +24,8 @@ ctrlc               = { workspace = true }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
 regex               = "1"
+sha2                = "0.10"
+base64              = "0.22"
 
 [dev-dependencies]
 socket2  = "0.5"
