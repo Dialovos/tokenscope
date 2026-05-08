@@ -182,35 +182,110 @@ SEC("uprobe/SSL_write_ex")
 int BPF_UPROBE(ssl_write_ex_entry, void *ssl, const void *buf, size_t num,
                size_t *written)
 {
-    (void)ssl; (void)buf; (void)num; (void)written;
-    return 0;
+    (void)written;
+    if (num == 0) return 0;
+    __u64 cgid = bpf_get_current_cgroup_id();
+    if (!cgroup_tracked(cgid)) return 0;
+    __u64 call_id = bpf_ktime_get_ns();
+    /* num is size_t; cap to UINT_MAX for our wire format. */
+    __u32 total = (num > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (__u32)num;
+    return emit_plaintext_chunks((__u64)ssl, call_id, cgid, buf,
+                                  total, 0 /* write */, 1 /* ex_variant */);
 }
 
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(ssl_read_entry, void *ssl, void *buf, int num)
 {
-    (void)ssl; (void)buf; (void)num;
+    if (num <= 0) return 0;
+    __u64 cgid = bpf_get_current_cgroup_id();
+    if (!cgroup_tracked(cgid)) return 0;
+
+    struct tls_inflight_key k = { .pid_tgid = bpf_get_current_pid_tgid() };
+    struct tls_inflight_val v = {
+        .ssl_ctx         = (__u64)ssl,
+        .buf_ptr         = (__u64)buf,
+        .entry_ts_ns     = bpf_ktime_get_ns(),
+        .entry_cgroup_id = cgid,
+        .readbytes_ptr   = 0,
+        .num             = (__u32)num,
+        .is_ex           = 0,
+    };
+    long ret = bpf_map_update_elem(&tls_inflight, &k, &v, BPF_ANY);
+    if (ret) {
+        __u32 zero = 0;
+        __u64 *c = bpf_map_lookup_elem(&tls_inflight_collision, &zero);
+        if (c) __sync_fetch_and_add(c, 1);
+    }
     return 0;
 }
 
 SEC("uretprobe/SSL_read")
 int BPF_URETPROBE(ssl_read_exit, int ret)
 {
-    (void)ret;
-    return 0;
+    if (ret <= 0) return 0;
+    struct tls_inflight_key k = { .pid_tgid = bpf_get_current_pid_tgid() };
+    struct tls_inflight_val *v = bpf_map_lookup_elem(&tls_inflight, &k);
+    if (!v || v->is_ex) return 0;
+
+    __u32 nbytes = ((__u32)ret < v->num) ? (__u32)ret : v->num;
+    __u64 call_id = v->entry_ts_ns;
+    __u64 ssl_ctx = v->ssl_ctx;
+    __u64 entry_cgid = v->entry_cgroup_id;
+    void *src = (void *)v->buf_ptr;
+    bpf_map_delete_elem(&tls_inflight, &k);
+    return emit_plaintext_chunks(ssl_ctx, call_id, entry_cgid, src, nbytes,
+                                  1 /* read */, 0 /* not _ex */);
 }
 
 SEC("uprobe/SSL_read_ex")
 int BPF_UPROBE(ssl_read_ex_entry, void *ssl, void *buf, size_t num,
                size_t *readbytes)
 {
-    (void)ssl; (void)buf; (void)num; (void)readbytes;
+    if (num == 0) return 0;
+    __u64 cgid = bpf_get_current_cgroup_id();
+    if (!cgroup_tracked(cgid)) return 0;
+
+    struct tls_inflight_key k = { .pid_tgid = bpf_get_current_pid_tgid() };
+    struct tls_inflight_val v = {
+        .ssl_ctx         = (__u64)ssl,
+        .buf_ptr         = (__u64)buf,
+        .entry_ts_ns     = bpf_ktime_get_ns(),
+        .entry_cgroup_id = cgid,
+        .readbytes_ptr   = (__u64)readbytes,
+        .num             = (num > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (__u32)num,
+        .is_ex           = 1,
+    };
+    long ret = bpf_map_update_elem(&tls_inflight, &k, &v, BPF_ANY);
+    if (ret) {
+        __u32 zero = 0;
+        __u64 *c = bpf_map_lookup_elem(&tls_inflight_collision, &zero);
+        if (c) __sync_fetch_and_add(c, 1);
+    }
     return 0;
 }
 
 SEC("uretprobe/SSL_read_ex")
 int BPF_URETPROBE(ssl_read_ex_exit, int ret)
 {
-    (void)ret;
-    return 0;
+    if (ret != 1) return 0;  /* SSL_read_ex returns 1 on success */
+    struct tls_inflight_key k = { .pid_tgid = bpf_get_current_pid_tgid() };
+    struct tls_inflight_val *v = bpf_map_lookup_elem(&tls_inflight, &k);
+    if (!v || !v->is_ex) return 0;
+
+    size_t readbytes = 0;
+    long pr = bpf_probe_read_user(&readbytes, sizeof(readbytes),
+                                   (void *)v->readbytes_ptr);
+    if (pr) { bpf_map_delete_elem(&tls_inflight, &k); return 0; }
+    __u32 nbytes;
+    if (readbytes > v->num) nbytes = v->num;
+    else if (readbytes > 0xFFFFFFFFu) nbytes = 0xFFFFFFFFu;
+    else nbytes = (__u32)readbytes;
+
+    __u64 call_id = v->entry_ts_ns;
+    __u64 ssl_ctx = v->ssl_ctx;
+    __u64 entry_cgid = v->entry_cgroup_id;
+    void *src = (void *)v->buf_ptr;
+    bpf_map_delete_elem(&tls_inflight, &k);
+    return emit_plaintext_chunks(ssl_ctx, call_id, entry_cgid, src, nbytes,
+                                  1 /* read */, 1 /* ex_variant */);
 }
