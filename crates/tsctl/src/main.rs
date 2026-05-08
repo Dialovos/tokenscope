@@ -39,7 +39,13 @@ enum Cmd {
     /// One-shot daemon status snapshot.
     Status,
     /// Live event stream from tsd. Exits on SIGINT.
-    Tail,
+    Tail {
+        /// Include decrypted TLS plaintext bytes inline (with redaction).
+        /// Without this flag, TLS records render as metadata + sha256
+        /// prefix only.
+        #[arg(long)]
+        show_plaintext: bool,
+    },
     /// Run an ad-hoc SQL query against the daemon's DuckDB (executed
     /// server-side via in-memory primary + ATTACH READ_ONLY).
     Query {
@@ -64,7 +70,7 @@ fn main() -> Result<()> {
             println!("tsctl {}", env!("CARGO_PKG_VERSION"));
         }
         Cmd::Status => cmd_status(&args.uds_path)?,
-        Cmd::Tail => cmd_tail(&args.uds_path)?,
+        Cmd::Tail { show_plaintext } => cmd_tail(&args.uds_path, show_plaintext)?,
         Cmd::Query { sql } => cmd_query(&args.uds_path, &sql)?,
     }
     Ok(())
@@ -102,9 +108,9 @@ fn cmd_status(uds_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tail(uds_path: &PathBuf) -> Result<()> {
+fn cmd_tail(uds_path: &PathBuf, include_plaintext: bool) -> Result<()> {
     let mut stream = connect(uds_path)?;
-    let req = serde_json::to_string(&Request::Tail)?;
+    let req = serde_json::to_string(&Request::Tail { include_plaintext })?;
     writeln!(stream, "{req}").context("write request")?;
 
     // SIGINT shuts down by closing the read side; the loop sees EOF.

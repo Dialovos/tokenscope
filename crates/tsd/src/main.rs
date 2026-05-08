@@ -11,26 +11,30 @@ mod cgroup;
 mod control;
 mod net_bytes;
 mod proc_cache;
+mod sink;
 mod skeletons;
 mod store;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use ts_bpf_sys::libbpf_rs::RingBufferBuilder;
-use ts_core::control::TailEvent;
 use ts_core::{decode_header, decode_net_connect, TsEventType};
 
 use crate::control::{Counters, Subscribers};
 use crate::proc_cache::ProcessCache;
+use crate::sink::{
+    EventEnvelope, EventSink, NetConnectEvent, ProcExecEvent,
+};
 use crate::skeletons::{load_all, SkelStorage};
 use crate::store::Store;
 
@@ -92,7 +96,7 @@ fn main() -> Result<()> {
     info!(flush_ms = args.flush_interval_ms, "BPF programs attached");
 
     let cache = RefCell::new(ProcessCache::new());
-    let store = RefCell::new(Store::open(&args.db_path).context("open DuckDB store")?);
+    let store = Store::open(&args.db_path).context("open DuckDB store")?;
     let stdout_enabled = !args.no_stdout;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -123,29 +127,22 @@ fn main() -> Result<()> {
         )
     };
 
+    // Single-writer sink owns the Store and runs a dedicated writer
+    // thread. Producers (ringbuf consumer + net_bytes flush) push
+    // `EventEnvelope`s via `events_tx` instead of touching Store /
+    // Subscribers directly. See `crates/tsd/src/sink.rs`.
+    let event_sink = EventSink::spawn(store, subscribers.clone()).context("spawn EventSink")?;
+    let events_tx = event_sink.tx.clone();
+
     let mut builder = RingBufferBuilder::new();
     builder
         .add(&skels.sched.maps.events, |data| {
-            handle_event(
-                data,
-                &cache,
-                &store,
-                &subscribers,
-                &counters,
-                stdout_enabled,
-            )
+            handle_event(data, &cache, &events_tx, &counters, stdout_enabled)
         })
         .map_err(|e| anyhow!("add sched ringbuf: {e}"))?;
     builder
         .add(&skels.net.maps.events, |data| {
-            handle_event(
-                data,
-                &cache,
-                &store,
-                &subscribers,
-                &counters,
-                stdout_enabled,
-            )
+            handle_event(data, &cache, &events_tx, &counters, stdout_enabled)
         })
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
@@ -162,8 +159,7 @@ fn main() -> Result<()> {
             net_bytes::flush(
                 &skels.net.maps.net_bytes,
                 &cache,
-                &store,
-                &subscribers,
+                &events_tx,
                 &counters,
                 stdout_enabled,
             );
@@ -175,27 +171,32 @@ fn main() -> Result<()> {
     net_bytes::flush(
         &skels.net.maps.net_bytes,
         &cache,
-        &store,
-        &subscribers,
+        &events_tx,
         &counters,
         stdout_enabled,
     );
-    // Drop order on scope exit:
-    //   ringbuf  -> releases closure borrows on &subscribers / &counters / &store
-    //   _control_server -> Drop flips its own shutdown, joins listener, removes socket
-    //   store    -> closes DuckDB
-    //   subscribers / counters -> Arcs go to zero
-    // No explicit drops needed; the natural reverse-declaration order
-    // handles everything.
+    // Explicit drop ordering for the new sink:
+    //   1. ringbuf — releases closure borrows on &cache / &counters /
+    //      events_tx so the local `events_tx` can be moved/dropped.
+    //   2. local events_tx — the cloned tx inside event_sink still
+    //      keeps the channel alive; we drop ours so we don't hold an
+    //      extra reference past the sink's own lifetime.
+    //   3. event_sink — Drop flips its shutdown flag, joins the
+    //      writer thread (which closes the DuckDB Connection on its
+    //      way out).
+    //   4. _control_server — its Drop flips its own shutdown, joins
+    //      the listener, removes the socket file.
+    //   5. subscribers / counters — Arcs go to zero.
+    drop(ringbuf);
+    drop(events_tx);
+    drop(event_sink);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_event(
     data: &[u8],
     cache: &RefCell<ProcessCache>,
-    store: &RefCell<Store>,
-    subscribers: &Subscribers,
+    events_tx: &SyncSender<EventEnvelope>,
     counters: &Counters,
     stdout: bool,
 ) -> i32 {
@@ -228,27 +229,17 @@ fn handle_event(
                     ts = hdr.ts_ns,
                 );
             }
-            if let Err(e) = store.borrow().insert_proc_exec(
-                hdr.ts_ns,
-                hdr.pid,
-                hdr.tgid,
-                hdr.cgroup_id,
-                &comm,
-                &cmdline,
-            ) {
-                warn!(?e, "store proc_exec");
-            }
-            let event = TailEvent::ProcExec {
+            // Push to the single-writer sink. `try_send` so a brief
+            // backpressure stall in the writer thread can't wedge the
+            // ringbuf consumer; the event is dropped on full sink.
+            let _ = events_tx.try_send(EventEnvelope::ProcExec(ProcExecEvent {
                 ts_ns: hdr.ts_ns,
                 pid: hdr.pid,
                 tgid: hdr.tgid,
-                comm: comm.clone(),
-                cmdline: cmdline.clone(),
-                cgroup_id: format!("{:#x}", hdr.cgroup_id),
-            };
-            if let Ok(line) = serde_json::to_string(&event) {
-                subscribers.broadcast(&line);
-            }
+                cgroup_id: hdr.cgroup_id,
+                comm,
+                cmdline,
+            }));
             counters.events_total.fetch_add(1, Ordering::Relaxed);
         }
         Some(TsEventType::NetConnect) => match decode_net_connect(payload) {
@@ -263,34 +254,18 @@ fn handle_event(
                         cgid = hdr.cgroup_id,
                     );
                 }
-                if let Err(e) = store.borrow().insert_net_connect(
-                    hdr.ts_ns,
-                    hdr.pid,
-                    hdr.tgid,
-                    hdr.cgroup_id,
-                    &comm,
-                    &cmdline,
-                    &pl.dst_addr,
-                    pl.dst_port,
-                    pl.family,
-                    pl.protocol,
-                ) {
-                    warn!(?e, "store net_connect");
-                }
-                let event = TailEvent::NetConnect {
+                let _ = events_tx.try_send(EventEnvelope::NetConnect(NetConnectEvent {
                     ts_ns: hdr.ts_ns,
                     pid: hdr.pid,
                     tgid: hdr.tgid,
-                    comm: comm.clone(),
-                    cmdline: cmdline.clone(),
-                    cgroup_id: format!("{:#x}", hdr.cgroup_id),
-                    dst: pl.dst_string(),
+                    cgroup_id: hdr.cgroup_id,
+                    comm,
+                    cmdline,
+                    dst_addr: pl.dst_addr,
+                    dst_port: pl.dst_port,
                     family: pl.family,
                     protocol: pl.protocol,
-                };
-                if let Ok(line) = serde_json::to_string(&event) {
-                    subscribers.broadcast(&line);
-                }
+                }));
                 counters.events_total.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => error!(?e, "decode net_connect failed"),

@@ -52,11 +52,22 @@ pub struct Counters {
     /// Currently-executing query workers. Bumped by an RAII guard on
     /// query entry; checked against MAX_CONCURRENT_QUERIES.
     pub active_queries: AtomicU32,
+    /// Tail frames dropped because a subscriber's bounded channel was
+    /// full when `broadcast`/`broadcast_envelope` tried to push.
+    /// Used by tsctl status / Phase 2.A tail-loss visibility.
+    pub tail_dropped_events: AtomicU64,
+}
+
+/// Per-subscriber state. Holds the bounded sender plus the rendering
+/// options the subscriber asked for at handshake time.
+struct SubscriberSlot {
+    sender: SyncSender<String>,
+    include_plaintext: bool,
 }
 
 #[derive(Clone)]
 pub struct Subscribers {
-    inner: Arc<Mutex<HashMap<u64, SyncSender<String>>>>,
+    inner: Arc<Mutex<HashMap<u64, SubscriberSlot>>>,
     next_id: Arc<AtomicU64>,
     counters: Arc<Counters>,
 }
@@ -70,14 +81,22 @@ impl Subscribers {
         }
     }
 
-    /// Push a JSON line to every active subscriber. Drops on a full
-    /// or disconnected channel; never blocks. Disconnected entries
-    /// are removed from the registry inline.
+    /// Push a pre-rendered string to every subscriber regardless of
+    /// per-subscriber options. Used for envelope-agnostic broadcasts
+    /// or for compatibility during the refactor. Drops on full or
+    /// disconnected channels; never blocks. Disconnected entries are
+    /// removed from the registry inline.
+    #[allow(dead_code)] // kept for future envelope-agnostic broadcasts
     pub fn broadcast(&self, line: &str) {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.retain(|_id, tx| match tx.try_send(line.to_string()) {
+        guard.retain(|_id, slot| match slot.sender.try_send(line.to_string()) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => true, // keep, just drop this frame
+            Err(TrySendError::Full(_)) => {
+                self.counters
+                    .tail_dropped_events
+                    .fetch_add(1, Ordering::Relaxed);
+                true // keep subscriber, just drop this frame
+            }
             Err(TrySendError::Disconnected(_)) => false,
         });
         self.counters
@@ -85,14 +104,46 @@ impl Subscribers {
             .store(guard.len() as u32, Ordering::Relaxed);
     }
 
-    /// Register a fresh subscriber. The returned `Guard` removes the
+    /// Render per-subscriber via `render_tail_line` from
+    /// `crate::sink::EventEnvelope`. Plaintext is only included for
+    /// subscribers that opted in at handshake time. Drops on full or
+    /// disconnected channels; never blocks.
+    pub fn broadcast_envelope(&self, env: &crate::sink::EventEnvelope) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|_id, slot| {
+            let line = render_tail_line(env, slot.include_plaintext);
+            match slot.sender.try_send(line) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    self.counters
+                        .tail_dropped_events
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        });
+        self.counters
+            .tail_subscribers_active
+            .store(guard.len() as u32, Ordering::Relaxed);
+    }
+
+    /// Register a fresh subscriber. `include_plaintext` records the
+    /// per-subscriber opt-in for TLS plaintext rendering (see
+    /// `render_tail_line`). The returned `Guard` removes the
     /// subscriber from the registry on drop, so per-connection
     /// cleanup is exception/early-return safe.
-    fn register(&self) -> (Receiver<String>, SubscriberGuard) {
+    fn register(&self, include_plaintext: bool) -> (Receiver<String>, SubscriberGuard) {
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.insert(id, tx);
+        guard.insert(
+            id,
+            SubscriberSlot {
+                sender: tx,
+                include_plaintext,
+            },
+        );
         self.counters
             .tail_subscribers_active
             .store(guard.len() as u32, Ordering::Relaxed);
@@ -110,7 +161,7 @@ impl Subscribers {
 /// stays accurate even on early return / panic.
 struct SubscriberGuard {
     id: u64,
-    inner: Arc<Mutex<HashMap<u64, SyncSender<String>>>>,
+    inner: Arc<Mutex<HashMap<u64, SubscriberSlot>>>,
     counters: Arc<Counters>,
 }
 
@@ -121,6 +172,50 @@ impl Drop for SubscriberGuard {
         self.counters
             .tail_subscribers_active
             .store(guard.len() as u32, Ordering::Relaxed);
+    }
+}
+
+/// Phase 2.A interim renderer: serialize each `EventEnvelope` into a
+/// minimal hand-built JSON shape. Per-subscriber plaintext gating
+/// lands in Task 11; for the refactor pass we just emit the
+/// envelope-shaped fields. The historical wire shape (the
+/// `TailEvent` JSON) is still emitted by the legacy `broadcast`
+/// callers in `main.rs` / `net_bytes.rs` until those move onto the
+/// envelope path in later tasks.
+pub fn render_tail_line(
+    env: &crate::sink::EventEnvelope,
+    _include_plaintext: bool,
+) -> String {
+    match env {
+        crate::sink::EventEnvelope::ProcExec(e) => {
+            format!(
+                r#"{{"kind":"proc.exec","ts_ns":{},"pid":{},"comm":"{}"}}"#,
+                e.ts_ns,
+                e.pid,
+                e.comm.escape_default()
+            )
+        }
+        crate::sink::EventEnvelope::NetConnect(e) => {
+            format!(
+                r#"{{"kind":"net.connect","ts_ns":{},"pid":{},"dst_port":{}}}"#,
+                e.ts_ns, e.pid, e.dst_port
+            )
+        }
+        crate::sink::EventEnvelope::NetBytesSnapshot(e) => {
+            format!(
+                r#"{{"kind":"net.bytes","snapshot_ts_ns":{},"sock_cookie":{},"tx":{},"rx":{}}}"#,
+                e.snapshot_ts_ns, e.sock_cookie, e.tx_bytes, e.rx_bytes
+            )
+        }
+        crate::sink::EventEnvelope::TlsPlaintext(e) => {
+            format!(
+                r#"{{"kind":"tls.{dir}","ts_ns":{ts},"pid":{pid},"chunk":{ci}}}"#,
+                dir = if e.direction == 0 { "write" } else { "read" },
+                ts = e.ts_ns,
+                pid = e.pid,
+                ci = e.chunk_index
+            )
+        }
     }
 }
 
@@ -360,8 +455,8 @@ fn handle_conn(
                 &server_shutdown,
             );
         }
-        Request::Tail => {
-            let (rx, _guard) = subscribers.register();
+        Request::Tail { include_plaintext } => {
+            let (rx, _guard) = subscribers.register(include_plaintext);
             // Block on recv with a periodic wakeup so we can notice
             // shutdown / client disconnect.
             while !global_shutdown.load(Ordering::Relaxed)

@@ -1,36 +1,32 @@
 //! Periodic flush of the BPF `net_bytes` LRU map.
 //!
 //! For each non-zero entry: optionally print a `NetBytes` line on
-//! stdout, insert a row into `events_net_bytes`, broadcast a JSON
-//! `NetBytes` event to tail subscribers, and bump the events_total
-//! counter. Map entries are NOT cleared — cumulative until kernel LRU
-//! eviction.
+//! stdout, and push a `NetBytesSnapshot` envelope onto the single
+//! writer sink. The sink owns the DuckDB connection and per-subscriber
+//! tail rendering. Map entries are NOT cleared — cumulative until
+//! kernel LRU eviction.
 
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::SyncSender;
 
-use tracing::warn;
 use ts_bpf_sys::libbpf_rs::{MapCore, MapFlags, MapMut};
-use ts_core::control::TailEvent;
 use ts_core::{decode_net_bytes_key, decode_net_bytes_value};
 
-use crate::control::{Counters, Subscribers};
+use crate::control::Counters;
 use crate::proc_cache::ProcessCache;
-use crate::store::Store;
+use crate::sink::{EventEnvelope, NetBytesSnapshot};
 use crate::wall_clock_ns;
 
-#[allow(clippy::too_many_arguments)]
 pub fn flush(
     map: &MapMut<'_>,
     cache: &RefCell<ProcessCache>,
-    store: &RefCell<Store>,
-    subscribers: &Subscribers,
+    events_tx: &SyncSender<EventEnvelope>,
     counters: &Counters,
     stdout: bool,
 ) {
     let snapshot = wall_clock_ns();
     let mut cache_mut = cache.borrow_mut();
-    let store_ref = store.borrow();
     for raw_key in map.keys() {
         let key = match decode_net_bytes_key(&raw_key) {
             Ok(k) => k,
@@ -59,31 +55,19 @@ pub fn flush(
                 ns = value.last_ns,
             );
         }
-        if let Err(e) = store_ref.insert_net_bytes(
-            snapshot,
-            key.sock_cookie,
-            value.pid,
-            &comm,
-            &cmdline,
-            value.tx_bytes,
-            value.rx_bytes,
-            value.last_ns,
-        ) {
-            warn!(?e, "store net_bytes");
-        }
-        let event = TailEvent::NetBytes {
+        // Drop on full sink — Counters tracks tail-side losses; this
+        // path's losses are budgeted into the same producer-side
+        // backpressure semantics as the ringbuf consumer.
+        let _ = events_tx.try_send(EventEnvelope::NetBytesSnapshot(NetBytesSnapshot {
             snapshot_ts_ns: snapshot,
-            sock_cookie: format!("{:#018x}", key.sock_cookie),
+            sock_cookie: key.sock_cookie,
             pid: value.pid,
-            comm: comm.clone(),
-            cmdline: cmdline.clone(),
-            tx: value.tx_bytes,
-            rx: value.rx_bytes,
+            comm,
+            cmdline,
+            tx_bytes: value.tx_bytes,
+            rx_bytes: value.rx_bytes,
             last_event_ns: value.last_ns,
-        };
-        if let Ok(line) = serde_json::to_string(&event) {
-            subscribers.broadcast(&line);
-        }
+        }));
         counters.events_total.fetch_add(1, Ordering::Relaxed);
     }
 }

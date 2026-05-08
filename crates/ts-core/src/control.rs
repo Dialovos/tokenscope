@@ -19,7 +19,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    Tail,
+    Tail {
+        /// Phase 2.A opt-in: when true, the server includes decrypted
+        /// TLS plaintext bytes (with redaction) inline in tail frames
+        /// for THIS subscriber. Default false keeps the wire shape of
+        /// `{"op":"tail"}` from older tsctl backward-compatible.
+        #[serde(default)]
+        include_plaintext: bool,
+    },
     Query { sql: String },
 }
 
@@ -122,10 +129,34 @@ mod tests {
 
     #[test]
     fn request_tail_round_trip() {
-        let r = Request::Tail;
+        let r = Request::Tail {
+            include_plaintext: false,
+        };
         let s = serde_json::to_string(&r).unwrap();
-        assert_eq!(s, r#"{"op":"tail"}"#);
+        // With #[serde(default)] the field is still emitted on
+        // serialize; only deserialize is forgiving (tested below).
+        assert_eq!(s, r#"{"op":"tail","include_plaintext":false}"#);
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn tail_request_default_include_plaintext_is_false() {
+        // Backward-compat for old tsctl that sends the bare op tag.
+        let r: Request = serde_json::from_str(r#"{"op":"tail"}"#).unwrap();
+        match r {
+            Request::Tail { include_plaintext } => assert!(!include_plaintext),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tail_request_explicit_include_plaintext_true() {
+        let r: Request =
+            serde_json::from_str(r#"{"op":"tail","include_plaintext":true}"#).unwrap();
+        match r {
+            Request::Tail { include_plaintext } => assert!(include_plaintext),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
