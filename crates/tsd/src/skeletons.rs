@@ -61,11 +61,11 @@ pub struct LoadedSkels<'obj> {
 /// Load and attach every BPF program. Populates the pinned
 /// `cgroup_filter` map with `tracked_cgroup_ids` so TLS probes (when
 /// attached in Task 9) fire only for the right processes.
-pub fn load_all(
-    storage: &mut SkelStorage,
+pub fn load_all<'obj>(
+    storage: &'obj mut SkelStorage,
     cgroup_root: File,
     tracked_cgroup_ids: &[u64],
-) -> Result<LoadedSkels<'_>> {
+) -> Result<LoadedSkels<'obj>> {
     let mut sched = SchedExecSkelBuilder::default()
         .open(&mut storage.sched)
         .context("open sched_exec skeleton")?
