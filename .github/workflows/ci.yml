@@ -29,18 +29,16 @@ jobs:
       - name: Install BPF toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              clang \
-              libbpf-dev \
-              linux-tools-common \
-              linux-tools-generic
-          # Only some runner kernels have a matching linux-tools package.
-          sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || true
-          # /usr/sbin/bpftool is a wrapper that fails when the running kernel has no
-          # linux-tools package; fall back to the binary under a kernel-versioned dir.
-          if ! bpftool version >/dev/null 2>&1; then
-            sudo ln -sf "$(find /usr/lib/linux-tools* -name bpftool -type f | head -1)" /usr/local/bin/bpftool
-          fi
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev
+          # Ubuntu's bpftool is a per-kernel wrapper that fails when the runner kernel
+          # has no working linux-tools build, so install upstream's static binary.
+          curl -fsSL -o bpftool.tar.gz \
+              https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
+          echo "09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c  bpftool.tar.gz" \
+              | sha256sum -c -
+          sudo tar -xzf bpftool.tar.gz -C /usr/local/bin bpftool
+          sudo chmod 0755 /usr/local/bin/bpftool
+          rm bpftool.tar.gz
           bpftool version
 
       - name: Generate vmlinux.h for the runner kernel
@@ -75,4 +73,4 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
               "$(command -v cargo)" test -p tsd \
-              -- --ignored --include-ignored --nocapture
+              -- --include-ignored --nocapture
