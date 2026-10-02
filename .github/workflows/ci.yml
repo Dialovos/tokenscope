@@ -56,6 +56,9 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Objects built against one Ubuntu's glibc don't link on another.
+          key: ${{ matrix.os }}
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
