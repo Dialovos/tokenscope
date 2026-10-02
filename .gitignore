@@ -14,3 +14,8 @@ vmlinux/btf-cache/
 *.duckdb
 *.duckdb.wal
 /data/
+# Project-local Python environment for research experiments
+/.venv/
+**/__pycache__/
+/experiments/.cache/
+/experiments/runs/
