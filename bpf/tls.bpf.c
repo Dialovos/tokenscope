@@ -19,6 +19,11 @@ char LICENSE[] SEC("license") = "GPL";
 #define MAX_CHUNKS 16
 #define CHUNK_BYTES 4096
 
+/* Older libbpf headers (Ubuntu 22.04) lack barrier_var. */
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 #define TLS_FLAG_TRUNCATED   (1 << 0)
 #define TLS_FLAG_READ_FAILED (1 << 1)
 #define TLS_FLAG_EX_VARIANT  (1 << 2)
@@ -154,6 +159,12 @@ static __always_inline int emit_plaintext_chunks(
                               | (ex_variant ? TLS_FLAG_EX_VARIANT : 0);
         __builtin_memset(r->pl._pad, 0, sizeof(r->pl._pad));
 
+        /* chunk_bytes is spilled across the helper calls above, and older
+         * verifiers (Ubuntu 22.04's kernel) lose its bounds on the reload.
+         * Clamp it again here; barrier_var keeps clang from dropping the
+         * check. */
+        barrier_var(chunk_bytes);
+        if (chunk_bytes > CHUNK_BYTES) chunk_bytes = CHUNK_BYTES;
         long pr = bpf_probe_read_user(r->plaintext, chunk_bytes,
                                       (const __u8 *)src + off);
         if (pr) {
