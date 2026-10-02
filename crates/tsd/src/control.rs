@@ -258,9 +258,7 @@ fn redactors() -> &'static [Regex] {
 /// other patterns replace the whole match with `***REDACTED***`.
 pub fn redact(input: &str) -> String {
     let res = redactors();
-    let mut out = res[0]
-        .replace_all(input, "$1: ***REDACTED***")
-        .into_owned();
+    let mut out = res[0].replace_all(input, "$1: ***REDACTED***").into_owned();
     for re in &res[1..] {
         out = re.replace_all(&out, "***REDACTED***").into_owned();
     }

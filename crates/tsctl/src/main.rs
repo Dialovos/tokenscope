@@ -117,7 +117,10 @@ fn cmd_status(uds_path: &PathBuf) -> Result<()> {
     println!("tls reserve failures   {}", resp.tls_reserve_failures);
     println!("tls scan duration (us) {}", resp.tls_scan_duration_us);
     println!("tls scan errors        {}", resp.tls_scan_errors);
-    println!("tls subs w/ plaintext  {}", resp.tls_subscribers_with_plaintext);
+    println!(
+        "tls subs w/ plaintext  {}",
+        resp.tls_subscribers_with_plaintext
+    );
     Ok(())
 }
 

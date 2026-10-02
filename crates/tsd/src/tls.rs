@@ -34,11 +34,10 @@ use regex::Regex;
 use ts_bpf_sys::libbpf_rs::{Link, MapCore, MapFlags, UprobeOpts};
 
 use crate::control::Counters;
-use crate::skeletons::LoadedSkels;
 use crate::sink::{EventEnvelope, TlsPlaintextEvent};
+use crate::skeletons::LoadedSkels;
 use ts_core::event::{
-    decode_tls_plaintext, TsEventHdr, TLS_FLAG_EX_VARIANT, TLS_FLAG_READ_FAILED,
-    TLS_FLAG_TRUNCATED,
+    decode_tls_plaintext, TsEventHdr, TLS_FLAG_EX_VARIANT, TLS_FLAG_READ_FAILED, TLS_FLAG_TRUNCATED,
 };
 
 /// How often to rescan `/proc/*/maps` for new libssl mappings.
@@ -154,11 +153,7 @@ pub fn handle_tls_record(
 
 /// Drive one rescan pass if the deadline has been reached. No-op
 /// otherwise. Updates counters in either case.
-pub fn discovery_tick(
-    state: &mut TlsState,
-    skels: &LoadedSkels<'_>,
-    counters: &Counters,
-) {
+pub fn discovery_tick(state: &mut TlsState, skels: &LoadedSkels<'_>, counters: &Counters) {
     let now = Instant::now();
     if now < state.next_rescan_at {
         return;
@@ -179,7 +174,14 @@ pub fn discovery_tick(
             if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
-            scan_pid_maps(state, skels, counters, &entry.path(), &mut seen, &mut errors);
+            scan_pid_maps(
+                state,
+                skels,
+                counters,
+                &entry.path(),
+                &mut seen,
+                &mut errors,
+            );
         }
     }
 
@@ -295,10 +297,7 @@ fn attach_libssl(
     )
     .ok();
 
-    if write_ex_link.is_none()
-        || read_ex_entry_link.is_none()
-        || read_ex_exit_link.is_none()
-    {
+    if write_ex_link.is_none() || read_ex_entry_link.is_none() || read_ex_exit_link.is_none() {
         counters
             .tls_libs_partial_attach
             .fetch_add(1, Ordering::Relaxed);

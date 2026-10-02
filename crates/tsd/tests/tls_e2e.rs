@@ -224,10 +224,7 @@ fn tls_curl_emits_chunks_and_rows_in_db() {
         wait_for_uds(&uds, Duration::from_secs(10)),
         "tsd never opened uds"
     );
-    assert!(
-        wait_for_attach(&uds) >= 1,
-        "tsd never attached to libssl"
-    );
+    assert!(wait_for_attach(&uds) >= 1, "tsd never attached to libssl");
 
     // Drive a TLS call. curl on Debian/Ubuntu links libssl.so.3.
     let curl_status = Command::new("curl")
