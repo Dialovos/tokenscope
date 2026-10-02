@@ -33,12 +33,13 @@ jobs:
               clang \
               libbpf-dev \
               linux-tools-common \
-              linux-tools-generic \
-              "linux-tools-$(uname -r)" || \
-            sudo apt-get install -y --no-install-recommends linux-tools-generic
-          # bpftool from the linux-tools-generic package may live under a kernel-versioned dir
-          if ! command -v bpftool >/dev/null; then
-            sudo ln -sf "$(find /usr/lib/linux-tools* -name bpftool | head -1)" /usr/local/bin/bpftool
+              linux-tools-generic
+          # Only some runner kernels have a matching linux-tools package.
+          sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || true
+          # /usr/sbin/bpftool is a wrapper that fails when the running kernel has no
+          # linux-tools package; fall back to the binary under a kernel-versioned dir.
+          if ! bpftool version >/dev/null 2>&1; then
+            sudo ln -sf "$(find /usr/lib/linux-tools* -name bpftool -type f | head -1)" /usr/local/bin/bpftool
           fi
           bpftool version
 
