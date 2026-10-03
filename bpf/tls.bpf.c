@@ -19,6 +19,11 @@ char LICENSE[] SEC("license") = "GPL";
 #define MAX_CHUNKS 16
 #define CHUNK_BYTES 4096
 
+/* Older libbpf headers (Ubuntu 22.04) lack barrier_var. */
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 #define TLS_FLAG_TRUNCATED   (1 << 0)
 #define TLS_FLAG_READ_FAILED (1 << 1)
 #define TLS_FLAG_EX_VARIANT  (1 << 2)
@@ -154,7 +159,14 @@ static __always_inline int emit_plaintext_chunks(
                               | (ex_variant ? TLS_FLAG_EX_VARIANT : 0);
         __builtin_memset(r->pl._pad, 0, sizeof(r->pl._pad));
 
-        long pr = bpf_probe_read_user(r->plaintext, chunk_bytes,
+        /* chunk_bytes is spilled across the helper calls above, and older
+         * verifiers (Ubuntu 22.04's kernel) lose its bounds on the reload.
+         * Clamp a 64-bit copy, so the checked register is the one passed
+         * to the helper; barrier_var keeps clang from dropping the check. */
+        __u64 read_len = chunk_bytes;
+        barrier_var(read_len);
+        if (read_len > CHUNK_BYTES) read_len = CHUNK_BYTES;
+        long pr = bpf_probe_read_user(r->plaintext, read_len,
                                       (const __u8 *)src + off);
         if (pr) {
             /* Read failed: don't bother zeroing the (4 KiB, ringbuf-

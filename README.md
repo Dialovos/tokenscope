@@ -20,6 +20,13 @@ sudo ./target/debug/tsd
 
 You'll see `TsEventHdr { ... }` lines printed for every process exec on the host.
 
+## History
+
+`main` was rewritten on 2026-09-28 to remove co-author trailers, so clones made
+before then hold old copies of those commits. If `git fetch` reports a forced
+update and `git cherry origin/main` prints no `+` lines, run
+`git reset --hard origin/main` and `git fetch --tags --force`.
+
 ## License
 
 Apache-2.0. See `LICENSE`.

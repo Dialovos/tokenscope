@@ -29,17 +29,16 @@ jobs:
       - name: Install BPF toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              clang \
-              libbpf-dev \
-              linux-tools-common \
-              linux-tools-generic \
-              "linux-tools-$(uname -r)" || \
-            sudo apt-get install -y --no-install-recommends linux-tools-generic
-          # bpftool from the linux-tools-generic package may live under a kernel-versioned dir
-          if ! command -v bpftool >/dev/null; then
-            sudo ln -sf "$(find /usr/lib/linux-tools* -name bpftool | head -1)" /usr/local/bin/bpftool
-          fi
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev
+          # Ubuntu's bpftool is a per-kernel wrapper that fails when the runner kernel
+          # has no working linux-tools build, so install upstream's static binary.
+          curl -fsSL -o bpftool.tar.gz \
+              https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
+          echo "09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c  bpftool.tar.gz" \
+              | sha256sum -c -
+          sudo tar -xzf bpftool.tar.gz -C /usr/local/bin bpftool
+          sudo chmod 0755 /usr/local/bin/bpftool
+          rm bpftool.tar.gz
           bpftool version
 
       - name: Generate vmlinux.h for the runner kernel
@@ -57,6 +56,9 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Objects built against one Ubuntu's glibc don't link on another.
+          key: ${{ matrix.os }}
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -74,4 +76,4 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
               "$(command -v cargo)" test -p tsd \
-              -- --ignored --include-ignored --nocapture
+              -- --include-ignored --nocapture

@@ -24,7 +24,7 @@
 //! prerequisite is missing. They never silently pass.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ fn own_cgroup_path() -> Option<PathBuf> {
     Some(PathBuf::from(format!("/sys/fs/cgroup{rel}")))
 }
 
-fn spawn_tsd(db: &PathBuf, uds: &PathBuf, track_cgroup: &PathBuf) -> std::process::Child {
+fn spawn_tsd(db: &Path, uds: &Path, track_cgroup: &Path) -> std::process::Child {
     Command::new(tsd_bin())
         .args([
             "--db-path",
@@ -118,7 +118,7 @@ fn drain_stderr(child: &mut std::process::Child) -> thread::JoinHandle<String> {
     })
 }
 
-fn wait_for_uds(uds: &PathBuf, deadline: Duration) -> bool {
+fn wait_for_uds(uds: &Path, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
         if uds.exists() {
@@ -129,7 +129,7 @@ fn wait_for_uds(uds: &PathBuf, deadline: Duration) -> bool {
     false
 }
 
-fn read_status(uds: &PathBuf) -> String {
+fn read_status(uds: &Path) -> String {
     let out = Command::new(tsctl_bin())
         .args(["--uds-path", uds.to_str().unwrap(), "status"])
         .output()
@@ -146,7 +146,7 @@ fn parse_status_field(status: &str, prefix: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn wait_for_attach(uds: &PathBuf) -> u64 {
+fn wait_for_attach(uds: &Path) -> u64 {
     let start = Instant::now();
     while start.elapsed() < ATTACH_DEADLINE {
         let n = parse_status_field(&read_status(uds), STATUS_LINE_PREFIX_TLS_ATTACHED);
@@ -224,10 +224,7 @@ fn tls_curl_emits_chunks_and_rows_in_db() {
         wait_for_uds(&uds, Duration::from_secs(10)),
         "tsd never opened uds"
     );
-    assert!(
-        wait_for_attach(&uds) >= 1,
-        "tsd never attached to libssl"
-    );
+    assert!(wait_for_attach(&uds) >= 1, "tsd never attached to libssl");
 
     // Drive a TLS call. curl on Debian/Ubuntu links libssl.so.3.
     let curl_status = Command::new("curl")
