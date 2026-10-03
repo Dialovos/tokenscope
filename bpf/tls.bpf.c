@@ -161,11 +161,12 @@ static __always_inline int emit_plaintext_chunks(
 
         /* chunk_bytes is spilled across the helper calls above, and older
          * verifiers (Ubuntu 22.04's kernel) lose its bounds on the reload.
-         * Clamp it again here; barrier_var keeps clang from dropping the
-         * check. */
-        barrier_var(chunk_bytes);
-        if (chunk_bytes > CHUNK_BYTES) chunk_bytes = CHUNK_BYTES;
-        long pr = bpf_probe_read_user(r->plaintext, chunk_bytes,
+         * Clamp a 64-bit copy, so the checked register is the one passed
+         * to the helper; barrier_var keeps clang from dropping the check. */
+        __u64 read_len = chunk_bytes;
+        barrier_var(read_len);
+        if (read_len > CHUNK_BYTES) read_len = CHUNK_BYTES;
+        long pr = bpf_probe_read_user(r->plaintext, read_len,
                                       (const __u8 *)src + off);
         if (pr) {
             /* Read failed: don't bother zeroing the (4 KiB, ringbuf-
