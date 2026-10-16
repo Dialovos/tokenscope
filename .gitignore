@@ -19,3 +19,5 @@ vmlinux/btf-cache/
 **/__pycache__/
 /experiments/.cache/
 /experiments/runs/
+# Generated results stay out of Git (repo-guard blocks them); regenerate or archive separately
+/experiments/results/
