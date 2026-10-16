@@ -6,6 +6,7 @@
 
 pub mod control;
 pub mod event;
+pub mod usage;
 
 pub use event::{
     decode_header, decode_net_bytes_key, decode_net_bytes_value, decode_net_connect, DecodeError,

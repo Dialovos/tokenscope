@@ -56,7 +56,7 @@ fn drain_stderr(child: &mut std::process::Child) -> thread::JoinHandle<String> {
 #[ignore = "requires CAP_BPF or root; run with --include-ignored under sudo"]
 fn control_plane_query_returns_rows_and_rejects_mutations() {
     let dir = TempDir::new().expect("tempdir");
-    let db_path = dir.path().join("events.duckdb");
+    let db_path = dir.path().join("private/usage.duckdb");
     let uds_path = dir.path().join("tsd.sock");
 
     let tsd = tsd_bin();

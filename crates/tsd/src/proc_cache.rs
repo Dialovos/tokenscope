@@ -11,14 +11,17 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 
 const CAPACITY: usize = 4096;
+#[cfg(test)]
 const CMDLINE_DISPLAY_CAP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
     pub comm: String,
+    /// Legacy shape; live collection always leaves this empty.
     pub cmdline: String,
 }
 
+#[cfg(test)]
 impl ProcessInfo {
     /// Truncated cmdline suitable for one-line display. Falls back to
     /// the comm in brackets when cmdline is empty (kernel thread,
@@ -78,7 +81,6 @@ impl Default for ProcessCache {
 
 fn read_proc(pid: u32) -> ProcessInfo {
     let comm_path = format!("/proc/{pid}/comm");
-    let cmdline_path = format!("/proc/{pid}/cmdline");
 
     let comm = match fs::read_to_string(&comm_path) {
         Ok(s) => s.trim_end_matches('\n').to_string(),
@@ -87,14 +89,14 @@ fn read_proc(pid: u32) -> ProcessInfo {
         Err(_) => "<error>".to_string(),
     };
 
-    let cmdline = match fs::read(&cmdline_path) {
-        Ok(bytes) => parse_cmdline(&bytes),
-        Err(_) => String::new(),
-    };
-
-    ProcessInfo { comm, cmdline }
+    // Arguments can contain credentials or prompt text. Read only comm.
+    ProcessInfo {
+        comm,
+        cmdline: String::new(),
+    }
 }
 
+#[cfg(test)]
 fn parse_cmdline(bytes: &[u8]) -> String {
     let trimmed_end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     let useful = &bytes[..trimmed_end];
@@ -178,6 +180,15 @@ mod tests {
         assert!(!info.comm.is_empty());
         assert_ne!(info.comm, "<gone>");
         assert_ne!(info.comm, "<error>");
+        assert!(info.cmdline.is_empty());
+    }
+
+    #[test]
+    fn live_process_lookup_never_collects_arguments() {
+        let mut cache = ProcessCache::new();
+        let info = cache.get_or_load(std::process::id());
+        assert!(!info.comm.is_empty());
+        assert!(info.cmdline.is_empty());
     }
 
     #[test]

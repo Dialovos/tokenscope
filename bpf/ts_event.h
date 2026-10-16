@@ -100,7 +100,7 @@ struct ts_net_bytes_value {
 
 /*
  * Payload for TS_TLS_PLAINTEXT (one record per chunk; up to 16 chunks per
- * SSL_* call). Total fixed payload: 40 bytes. Trailing plaintext slice of
+ * SSL_* call). Total fixed payload: 88 bytes. Trailing plaintext slice of
  * exactly chunk_bytes follows; max 4096 bytes.
  *
  * Stream-call key: (tgid, ssl_ctx, direction, call_id) where call_id =
@@ -117,9 +117,15 @@ struct ts_tls_plaintext_payload {
     __u8  direction;        /* 0 = write, 1 = read */
     __u8  flags;            /* bit 0=truncated, bit 1=read_failed, bit 2=ex_variant */
     __u8  _pad[4];
+    __u64 process_start;
+    __u64 connection_generation;
+    __u64 call_sequence;
+    __u64 loss_epoch;
+    __u64 exec_generation;
+    __u64 stream_offset;    /* accepted bytes in this direction before the call */
 };
 
-_Static_assert(sizeof(struct ts_tls_plaintext_payload) == 40,
-               "tls payload must be exactly 40 bytes");
+_Static_assert(sizeof(struct ts_tls_plaintext_payload) == 88,
+               "tls payload must be exactly 88 bytes");
 
 #endif /* TS_EVENT_H */

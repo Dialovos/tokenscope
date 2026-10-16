@@ -34,10 +34,10 @@ use regex::Regex;
 use ts_bpf_sys::libbpf_rs::{Link, MapCore, MapFlags, UprobeOpts};
 
 use crate::control::Counters;
+use crate::sink::{EventEnvelope, TlsCheckpoint, TlsPlaintextEvent};
 use crate::skeletons::LoadedSkels;
-use crate::sink::{EventEnvelope, TlsPlaintextEvent};
 use ts_core::event::{
-    decode_tls_plaintext, TsEventHdr, TLS_FLAG_EX_VARIANT, TLS_FLAG_READ_FAILED,
+    decode_tls_plaintext, TsEventHdr, TLS_FLAG_END, TLS_FLAG_EX_VARIANT, TLS_FLAG_READ_FAILED,
     TLS_FLAG_TRUNCATED,
 };
 
@@ -49,13 +49,9 @@ pub const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 #[allow(dead_code)] // refcount is informational only today
 pub struct AttachedLib {
     inode_path: PathBuf,
-    write_link: Link,
-    write_ex_link: Option<Link>,
-    read_entry_link: Link,
-    read_exit_link: Link,
-    read_ex_entry_link: Option<Link>,
-    read_ex_exit_link: Option<Link>,
+    links: Vec<Link>,
     refcount: u32,
+    cookie: u64,
 }
 
 /// Lives for the daemon's life. Tracks which libssl files we've
@@ -68,6 +64,7 @@ pub struct TlsState {
     pub next_rescan_at: Instant,
     /// Compiled-once regex for the maps line shape.
     libssl_re: Regex,
+    next_library_cookie: u64,
 }
 
 impl Default for TlsState {
@@ -82,6 +79,26 @@ impl TlsState {
             attached: HashMap::new(),
             next_rescan_at: Instant::now(), // do first pass immediately
             libssl_re: Regex::new(r"r-xp .* (\S*libssl\.so(?:\.\S+)?)$").unwrap(),
+            next_library_cookie: 1,
+        }
+    }
+
+    /// Stop every library before detaching any individual API link.
+    pub fn disable_capture(&self, skels: &LoadedSkels<'_>) -> Result<()> {
+        let mut failure = None;
+        for lib in self.attached.values() {
+            if let Err(error) = skels
+                .tls
+                .maps
+                .tls_enabled_libraries
+                .delete(&lib.cookie.to_ne_bytes())
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
         }
     }
 }
@@ -96,6 +113,8 @@ pub fn handle_tls_record(
 ) -> i32 {
     const HDR: usize = std::mem::size_of::<TsEventHdr>();
     if data.len() < HDR {
+        // A record we cannot attribute to a lifetime is global capture loss.
+        counters.tls_capture_errors.fetch_add(1, Ordering::Relaxed);
         return 0;
     }
     // SAFETY: TsEventHdr is repr(C), 56 bytes. We copy the bytes out
@@ -110,6 +129,7 @@ pub fn handle_tls_record(
         Ok(x) => x,
         Err(e) => {
             tracing::warn!(error = ?e, "decode tls plaintext");
+            counters.tls_capture_errors.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
     };
@@ -128,6 +148,13 @@ pub fn handle_tls_record(
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    let lifetime = ts_core::usage::ConnectionKey {
+        tgid: hdr.tgid,
+        process_start: pl.process_start,
+        exec_generation: pl.exec_generation,
+        ssl_ctx: pl.ssl_ctx,
+        generation: pl.connection_generation,
+    };
     let env = EventEnvelope::TlsPlaintext(TlsPlaintextEvent {
         ts_ns: hdr.ts_ns,
         pid: hdr.pid,
@@ -144,21 +171,45 @@ pub fn handle_tls_record(
         truncated,
         read_failed,
         ex_variant,
+        process_start: pl.process_start,
+        exec_generation: pl.exec_generation,
+        connection_generation: pl.connection_generation,
+        call_sequence: pl.call_sequence,
+        loss_epoch: pl.loss_epoch,
+        stream_offset: pl.stream_offset,
+        lifecycle_end: pl.flags & TLS_FLAG_END != 0,
         plaintext: plaintext.to_vec(),
     });
-    if let Err(std::sync::mpsc::TrySendError::Full(_)) = events_tx.try_send(env) {
+    let closure = pl.flags & TLS_FLAG_END != 0;
+    if events_tx.try_send(env).is_err() {
         counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
+        // A dropped data record is sized by the next offset or inventory of its
+        // lifetime. A dropped closure has no successor, so record it beside the
+        // queue; only this lifetime loses trust unless the side set overflows.
+        if !closure {
+            return 0;
+        }
+        let mut dropped = counters
+            .tls_dropped_lifetimes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if dropped.len() < MAX_DROPPED_LIFETIMES || dropped.contains(&lifetime) {
+            dropped.insert(lifetime);
+        } else {
+            counters
+                .tls_unattributed_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     0
 }
 
+/// Bound on lifetimes awaiting invalidation after queue drops.
+const MAX_DROPPED_LIFETIMES: usize = 4096;
+
 /// Drive one rescan pass if the deadline has been reached. No-op
 /// otherwise. Updates counters in either case.
-pub fn discovery_tick(
-    state: &mut TlsState,
-    skels: &LoadedSkels<'_>,
-    counters: &Counters,
-) {
+pub fn discovery_tick(state: &mut TlsState, skels: &LoadedSkels<'_>, counters: &Counters) {
     let now = Instant::now();
     if now < state.next_rescan_at {
         return;
@@ -179,7 +230,14 @@ pub fn discovery_tick(
             if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
-            scan_pid_maps(state, skels, counters, &entry.path(), &mut seen, &mut errors);
+            scan_pid_maps(
+                state,
+                skels,
+                counters,
+                &entry.path(),
+                &mut seen,
+                &mut errors,
+            );
         }
     }
 
@@ -234,7 +292,13 @@ fn scan_pid_maps(
             lib.refcount += 1;
             continue;
         }
-        match attach_libssl(skels, &proc_root, counters) {
+        let cookie = state.next_library_cookie;
+        let Some(next_cookie) = cookie.checked_add(1) else {
+            counters.tls_libs_skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        state.next_library_cookie = next_cookie;
+        match attach_libssl(skels, &proc_root, cookie) {
             Ok(lib) => {
                 state.attached.insert(key, lib);
                 counters.tls_libs_attached.fetch_add(1, Ordering::Relaxed);
@@ -247,72 +311,35 @@ fn scan_pid_maps(
     }
 }
 
-fn attach_libssl(
-    skels: &LoadedSkels<'_>,
-    libssl_path: &Path,
-    counters: &Counters,
-) -> Result<AttachedLib> {
-    // Required pair (basic): SSL_write entry + SSL_read entry/exit.
-    let write_link = attach_one(
-        &skels.tls.progs.ssl_write_entry,
-        libssl_path,
-        "SSL_write",
-        false,
-    )?;
-    let read_entry_link = attach_one(
-        &skels.tls.progs.ssl_read_entry,
-        libssl_path,
-        "SSL_read",
-        false,
-    )?;
-    let read_exit_link = attach_one(
-        &skels.tls.progs.ssl_read_exit,
-        libssl_path,
-        "SSL_read",
-        true,
-    )?;
-
-    // Optional _ex pair: tolerate missing symbols (older libssl).
-    let write_ex_link = attach_one(
-        &skels.tls.progs.ssl_write_ex_entry,
-        libssl_path,
-        "SSL_write_ex",
-        false,
-    )
-    .ok();
-    let read_ex_entry_link = attach_one(
-        &skels.tls.progs.ssl_read_ex_entry,
-        libssl_path,
-        "SSL_read_ex",
-        false,
-    )
-    .ok();
-    let read_ex_exit_link = attach_one(
-        &skels.tls.progs.ssl_read_ex_exit,
-        libssl_path,
-        "SSL_read_ex",
-        true,
-    )
-    .ok();
-
-    if write_ex_link.is_none()
-        || read_ex_entry_link.is_none()
-        || read_ex_exit_link.is_none()
-    {
-        counters
-            .tls_libs_partial_attach
-            .fetch_add(1, Ordering::Relaxed);
+fn attach_libssl(skels: &LoadedSkels<'_>, libssl_path: &Path, cookie: u64) -> Result<AttachedLib> {
+    let mut links = Vec::new();
+    for (prog, symbol, ret) in [
+        (&skels.tls.progs.ssl_write_entry, "SSL_write", false),
+        (&skels.tls.progs.ssl_write_exit, "SSL_write", true),
+        (&skels.tls.progs.ssl_read_entry, "SSL_read", false),
+        (&skels.tls.progs.ssl_read_exit, "SSL_read", true),
+        (&skels.tls.progs.ssl_write_ex_entry, "SSL_write_ex", false),
+        (&skels.tls.progs.ssl_write_ex_exit, "SSL_write_ex", true),
+        (&skels.tls.progs.ssl_read_ex_entry, "SSL_read_ex", false),
+        (&skels.tls.progs.ssl_read_ex_exit, "SSL_read_ex", true),
+        (&skels.tls.progs.ssl_new_exit, "SSL_new", true),
+        (&skels.tls.progs.ssl_free_entry, "SSL_free", false),
+        (&skels.tls.progs.ssl_clear_entry, "SSL_clear", false),
+    ] {
+        links.push(attach_one(prog, libssl_path, symbol, ret, cookie)?);
     }
-
+    // Entry/return and lifecycle coverage is all-or-error. Before this update,
+    // attach cookies keep every probe inert; any failure drops all owned links.
+    skels
+        .tls
+        .maps
+        .tls_enabled_libraries
+        .update(&cookie.to_ne_bytes(), &[1], MapFlags::NO_EXIST)?;
     Ok(AttachedLib {
         inode_path: libssl_path.to_path_buf(),
-        write_link,
-        write_ex_link,
-        read_entry_link,
-        read_exit_link,
-        read_ex_entry_link,
-        read_ex_exit_link,
+        links,
         refcount: 1,
+        cookie,
     })
 }
 
@@ -321,10 +348,12 @@ fn attach_one(
     libssl_path: &Path,
     func_name: &str,
     retprobe: bool,
+    cookie: u64,
 ) -> Result<Link> {
     let opts = UprobeOpts {
         func_name: func_name.into(),
         retprobe,
+        cookie,
         ..Default::default()
     };
     prog.attach_uprobe_with_opts(-1, libssl_path, 0, opts)
@@ -336,51 +365,190 @@ fn attach_one(
         })
 }
 
-fn pump_percpu_counters(skels: &LoadedSkels<'_>, counters: &Counters) {
+pub fn pump_percpu_counters(skels: &LoadedSkels<'_>, counters: &Counters) {
     let zero = 0u32.to_ne_bytes();
-    if let Ok(Some(values)) = skels
-        .tls
-        .maps
-        .tls_reserve_fail
-        .lookup_percpu(&zero, MapFlags::ANY)
-    {
-        let total: u64 = values
-            .iter()
-            .map(|v| {
-                let mut buf = [0u8; 8];
-                let n = v.len().min(8);
-                buf[..n].copy_from_slice(&v[..n]);
-                u64::from_ne_bytes(buf)
-            })
-            .sum();
-        counters
-            .tls_reserve_failures
-            .store(total, Ordering::Relaxed);
+    for (map, counter) in [
+        (
+            &skels.tls.maps.tls_reserve_fail,
+            &counters.tls_reserve_failures,
+        ),
+        (
+            &skels.tls.maps.tls_inflight_collision,
+            &counters.tls_inflight_collisions,
+        ),
+        (&skels.tls.maps.tls_map_fail, &counters.tls_map_failures),
+        (
+            &skels.tls.maps.tls_missing_state,
+            &counters.tls_missing_states,
+        ),
+        (
+            &skels.tls.maps.tls_outparam_fail,
+            &counters.tls_outparam_failures,
+        ),
+        (&skels.tls.maps.tls_close_lost, &counters.tls_close_lost),
+    ] {
+        match map.lookup_percpu(&zero, MapFlags::ANY) {
+            Ok(Some(values)) => {
+                let total = values
+                    .iter()
+                    .filter_map(|v| v.get(..8))
+                    .map(|v| u64::from_ne_bytes(v.try_into().unwrap()))
+                    .sum();
+                counter.store(total, Ordering::Relaxed);
+            }
+            _ => {
+                counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
-    if let Ok(Some(values)) = skels
-        .tls
-        .maps
-        .tls_inflight_collision
-        .lookup_percpu(&zero, MapFlags::ANY)
-    {
-        let total: u64 = values
-            .iter()
-            .map(|v| {
-                let mut buf = [0u8; 8];
-                let n = v.len().min(8);
-                buf[..n].copy_from_slice(&v[..n]);
-                u64::from_ne_bytes(buf)
-            })
-            .sum();
-        counters
-            .tls_inflight_collisions
-            .store(total, Ordering::Relaxed);
+}
+
+/// Kernel lifetime inventories, read from the main loop after each poll.
+#[derive(Default)]
+pub struct Inventory {
+    pass: u64,
+    /// Lifetimes whose process had exited when the previous pass read them.
+    exited: HashSet<Vec<u8>>,
+}
+
+impl Inventory {
+    /// Send one inventory per kernel lifetime, then an end-of-pass marker. These
+    /// live snapshots race with emission, so the writer treats an inventory
+    /// ahead of consumed records as in transit until the next pass.
+    ///
+    /// A lifetime whose process exited before the previous pass has delivered
+    /// every record; its final inventory goes to the writer and the kernel entry
+    /// is removed. `final_pass` runs after capture stopped and the ring drained:
+    /// its inventories are exact and use blocking sends.
+    pub fn checkpoint(
+        &mut self,
+        skels: &LoadedSkels<'_>,
+        tx: &SyncSender<EventEnvelope>,
+        counters: &Counters,
+        final_pass: bool,
+    ) {
+        pump_percpu_counters(skels, counters);
+        self.pass += 1;
+        let pass = self.pass;
+        let send = |env: EventEnvelope| {
+            let sent = if final_pass {
+                tx.send(env).is_ok()
+            } else {
+                tx.try_send(env).is_ok()
+            };
+            if !sent {
+                counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
+            }
+            sent
+        };
+        let map = &skels.tls.maps.tls_connections;
+        let mut exited = HashSet::new();
+        for key in map.keys() {
+            let value = match map.lookup(&key, MapFlags::ANY) {
+                Ok(Some(v)) if key.len() == 32 && v.len() == 56 => v,
+                // Closed between listing and lookup; its END records follow.
+                Ok(None) => continue,
+                _ => {
+                    counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let u64_at =
+                |b: &[u8], off: usize| u64::from_ne_bytes(b[off..off + 8].try_into().unwrap());
+            let c = TlsCheckpoint {
+                connection: ts_core::usage::ConnectionKey {
+                    tgid: u64_at(&key, 0) as u32,
+                    process_start: u64_at(&key, 8),
+                    exec_generation: u64_at(&key, 16),
+                    ssl_ctx: u64_at(&key, 24),
+                    generation: u64_at(&value, 0),
+                },
+                sequence: [u64_at(&value, 8), u64_at(&value, 16)],
+                loss_epoch: [u64_at(&value, 24), u64_at(&value, 32)],
+                accepted: [u64_at(&value, 40), u64_at(&value, 48)],
+                ts_ns: monotonic_ns(),
+                pass,
+                final_pass,
+            };
+            if !final_pass && self.exited.contains(&key) {
+                if send(EventEnvelope::TlsLifetimeGone(c)) {
+                    if map.delete(&key).is_ok() {
+                        counters.tls_lifetimes_swept.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    exited.insert(key);
+                }
+                continue;
+            }
+            if !final_pass && !process_alive(c.connection.tgid, c.connection.process_start) {
+                exited.insert(key);
+            }
+            send(EventEnvelope::TlsCheckpoint(c));
+        }
+        self.exited = exited;
+        send(EventEnvelope::TlsCheckpointEnd {
+            pass,
+            ts_ns: monotonic_ns(),
+        });
     }
+}
+
+/// Whether the process that started at `start_ns` (BPF `start_boottime`) still
+/// owns `tgid`. procfs reports the same clock in USER_HZ ticks. Unreadable
+/// state counts as alive; only a definite exit removes a lifetime.
+fn process_alive(tgid: u32, start_ns: u64) -> bool {
+    let stat = match fs::read_to_string(format!("/proc/{tgid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return true;
+    }
+    match parse_start_ticks(&stat) {
+        Some(start) => start == start_ns / (1_000_000_000 / ticks as u64),
+        None => true,
+    }
+}
+
+/// Field 22 (`starttime`). The command name may contain spaces or parentheses.
+fn parse_start_ticks(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_start_matches_procfs_ticks() {
+        let stat = "123 (a) b (c)) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 rest";
+        assert_eq!(parse_start_ticks(stat), Some(4242));
+        let own = std::process::id();
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let start =
+            parse_start_ticks(&fs::read_to_string(format!("/proc/{own}/stat")).unwrap()).unwrap();
+        let ns = start * (1_000_000_000 / ticks);
+        assert!(process_alive(own, ns));
+        assert!(process_alive(own, ns + 1_000_000_000 / ticks - 1));
+        assert!(!process_alive(own, ns + 1_000_000_000 / ticks));
+        assert!(!process_alive(u32::MAX - 1, ns));
+    }
 
     #[test]
     fn libssl_regex_matches_typical_lines() {

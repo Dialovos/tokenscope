@@ -12,7 +12,7 @@
 //! non-blocking try_send to each subscriber's bounded channel. Slow
 //! clients drop frames; ingest is never blocked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -83,8 +83,33 @@ pub struct Counters {
     pub tls_scan_duration_us: AtomicU64,
     /// /proc/<pid>/maps read errors during the last scan.
     pub tls_scan_errors: AtomicU32,
-    /// Subset of tail subscribers that asked for include_plaintext=true.
+    /// Legacy protocol field; plaintext subscribers are refused in v2.
     pub tls_subscribers_with_plaintext: AtomicU32,
+    pub writer_healthy: AtomicBool,
+    pub capture_epoch: Mutex<String>,
+    pub persistence_errors: AtomicU64,
+    pub rows_flushed: AtomicU64,
+    pub writer_events_processed: AtomicU64,
+    pub tls_map_failures: AtomicU64,
+    pub tls_missing_states: AtomicU64,
+    pub tls_outparam_failures: AtomicU64,
+    pub usage_admission_blocked: AtomicBool,
+    pub usage_generation_barrier: AtomicU64,
+    pub usage_retained_bytes: AtomicU64,
+    pub usage_lifetimes_tracked: AtomicU64,
+    /// Unattributable TLS capture loss: undecodable records, ring poll errors,
+    /// capture-control failure. Every open lifetime loses trust.
+    pub tls_capture_errors: AtomicU64,
+    /// Aggregated from BPF tls_close_lost: a lifetime inventory was destroyed.
+    pub tls_close_lost: AtomicU64,
+    /// TLS records dropped at the writer queue without an attributable lifetime.
+    pub tls_unattributed_drops: AtomicU64,
+    /// Lifetimes whose dropped TLS records the writer must invalidate.
+    pub tls_dropped_lifetimes: Mutex<HashSet<ts_core::usage::ConnectionKey>>,
+    /// Kernel lifetime entries removed after their process exited.
+    pub tls_lifetimes_swept: AtomicU64,
+    pub usage_connections_refused: AtomicU64,
+    pub usage_connections_out_of_scope: AtomicU64,
 }
 
 /// Per-subscriber state. Holds the bounded sender plus the rendering
@@ -133,14 +158,15 @@ impl Subscribers {
             .store(guard.len() as u32, Ordering::Relaxed);
     }
 
-    /// Render per-subscriber via `render_tail_line` from
-    /// `crate::sink::EventEnvelope`. Plaintext is only included for
-    /// subscribers that opted in at handshake time. Drops on full or
-    /// disconnected channels; never blocks.
+    /// Broadcast metadata and numeric usage with the shared capture epoch.
+    /// Drops on full or disconnected channels; never exports TLS content.
     pub fn broadcast_envelope(&self, env: &crate::sink::EventEnvelope) {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.retain(|_id, slot| {
-            let line = render_tail_line(env, slot.include_plaintext);
+            let mut rendered: serde_json::Value =
+                serde_json::from_str(&render_tail_line(env, slot.include_plaintext)).unwrap();
+            rendered["capture_epoch"] = self.counters.capture_epoch.lock().unwrap().clone().into();
+            let line = rendered.to_string();
             match slot.sender.try_send(line) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
@@ -157,11 +183,9 @@ impl Subscribers {
             .store(guard.len() as u32, Ordering::Relaxed);
     }
 
-    /// Register a fresh subscriber. `include_plaintext` records the
-    /// per-subscriber opt-in for TLS plaintext rendering (see
-    /// `render_tail_line`). The returned `Guard` removes the
-    /// subscriber from the registry on drop, so per-connection
-    /// cleanup is exception/early-return safe.
+    /// Register a fresh subscriber after the plaintext-rejection handshake.
+    /// The legacy rendering flag cannot export content. The returned guard
+    /// removes the subscriber on drop, including early returns.
     fn register(&self, include_plaintext: bool) -> (Receiver<String>, SubscriberGuard) {
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -204,17 +228,14 @@ impl Drop for SubscriberGuard {
     }
 }
 
+#[cfg(test)]
 use std::sync::OnceLock;
 
-use base64::Engine as _;
+#[cfg(test)]
 use regex::Regex;
-use sha2::{Digest, Sha256};
 
-/// Compiled-once redaction patterns. Match left-to-right; each match
-/// is replaced with `***REDACTED***` (the header-style first pattern
-/// preserves the captured header name). Server-side only — the BLOB
-/// stored in DuckDB keeps full fidelity (codex BLOCKING #6: never
-/// trust the client to redact, even on opt-in).
+/// Legacy redaction helper tests. Default capture never exports content.
+#[cfg(test)]
 fn redactors() -> &'static [Regex] {
     static R: OnceLock<Vec<Regex>> = OnceLock::new();
     R.get_or_init(|| {
@@ -256,40 +277,18 @@ fn redactors() -> &'static [Regex] {
 /// Apply every redaction pattern in order. The first regex (header
 /// assignment) keeps the header name visible by capturing it; all
 /// other patterns replace the whole match with `***REDACTED***`.
+#[cfg(test)]
 pub fn redact(input: &str) -> String {
     let res = redactors();
-    let mut out = res[0]
-        .replace_all(input, "$1: ***REDACTED***")
-        .into_owned();
+    let mut out = res[0].replace_all(input, "$1: ***REDACTED***").into_owned();
     for re in &res[1..] {
         out = re.replace_all(&out, "***REDACTED***").into_owned();
     }
     out
 }
 
-fn sha256_prefix_8(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    let digest = h.finalize();
-    // First 4 bytes → 8 hex chars.
-    let mut s = String::with_capacity(8);
-    for b in &digest[..4] {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Render an `EventEnvelope` as a one-line JSON string for tsctl tail.
-///
-/// For `TlsPlaintext`:
-/// - `plaintext_sha256` is always present (4-byte prefix → 8 hex chars)
-///   so subscribers can dedupe / spot replays without seeing content.
-/// - `plaintext_b64` is present **only** when the subscriber opted into
-///   `include_plaintext` at handshake time. The bytes are passed through
-///   `redact` first so common API-key shapes never reach a tail viewer
-///   in cleartext (codex BLOCKING #6 — server-side enforcement).
-pub fn render_tail_line(env: &crate::sink::EventEnvelope, include_plaintext: bool) -> String {
+/// Render metadata only; plaintext requests are rejected at the handshake.
+pub fn render_tail_line(env: &crate::sink::EventEnvelope, _include_plaintext: bool) -> String {
     use crate::sink::EventEnvelope::*;
     match env {
         ProcExec(e) => serde_json::json!({
@@ -320,6 +319,9 @@ pub fn render_tail_line(env: &crate::sink::EventEnvelope, include_plaintext: boo
             "rx": e.rx_bytes,
         })
         .to_string(),
+        Shutdown => String::new(),
+        TlsCheckpoint(_) | TlsCheckpointEnd { .. } | TlsLifetimeGone(_) => String::new(),
+        Usage(e) => serde_json::json!({"kind":"usage.reported", "observation":e}).to_string(),
         TlsPlaintext(e) => {
             let mut obj = serde_json::Map::new();
             obj.insert(
@@ -333,25 +335,27 @@ pub fn render_tail_line(env: &crate::sink::EventEnvelope, include_plaintext: boo
             obj.insert("ts_ns".into(), e.ts_ns.into());
             obj.insert("pid".into(), e.pid.into());
             obj.insert("tgid".into(), e.tgid.into());
+            obj.insert("cgroup_id".into(), e.cgroup_id.into());
             obj.insert("comm".into(), e.comm.clone().into());
             obj.insert("ssl_ctx".into(), format!("0x{:x}", e.ssl_ctx).into());
             obj.insert("call_id".into(), e.call_id.into());
+            obj.insert("process_start".into(), e.process_start.into());
+            obj.insert("exec_generation".into(), e.exec_generation.into());
+            obj.insert(
+                "connection_generation".into(),
+                e.connection_generation.into(),
+            );
+            obj.insert("call_sequence".into(), e.call_sequence.into());
+            obj.insert("loss_epoch".into(), e.loss_epoch.into());
+            obj.insert("stream_offset".into(), e.stream_offset.into());
+            obj.insert("lifecycle_end".into(), e.lifecycle_end.into());
             obj.insert("total_bytes".into(), e.total_bytes.into());
             obj.insert("chunk_index".into(), e.chunk_index.into());
             obj.insert("chunk_total".into(), e.chunk_total.into());
             obj.insert("chunk_bytes".into(), e.chunk_bytes.into());
             obj.insert("truncated".into(), e.truncated.into());
             obj.insert("ex_variant".into(), e.ex_variant.into());
-            obj.insert(
-                "plaintext_sha256".into(),
-                sha256_prefix_8(&e.plaintext).into(),
-            );
-            if include_plaintext && !e.plaintext.is_empty() {
-                let rendered = String::from_utf8_lossy(&e.plaintext).into_owned();
-                let redacted = redact(&rendered);
-                let b64 = base64::engine::general_purpose::STANDARD.encode(redacted.as_bytes());
-                obj.insert("plaintext_b64".into(), b64.into());
-            }
+            obj.insert("read_failed".into(), e.read_failed.into());
             serde_json::Value::Object(obj).to_string()
         }
     }
@@ -594,6 +598,28 @@ fn handle_conn(
                 tls_subscribers_with_plaintext: counters
                     .tls_subscribers_with_plaintext
                     .load(Ordering::Relaxed),
+                writer_healthy: counters.writer_healthy.load(Ordering::Relaxed),
+                capture_epoch: counters.capture_epoch.lock().unwrap().clone(),
+                persistence_errors: counters.persistence_errors.load(Ordering::Relaxed),
+                rows_flushed: counters.rows_flushed.load(Ordering::Relaxed),
+                writer_events_processed: counters.writer_events_processed.load(Ordering::Relaxed),
+                tls_map_failures: counters.tls_map_failures.load(Ordering::Relaxed),
+                tls_missing_states: counters.tls_missing_states.load(Ordering::Relaxed),
+                tls_outparam_failures: counters.tls_outparam_failures.load(Ordering::Relaxed),
+                usage_admission_blocked: counters.usage_admission_blocked.load(Ordering::Relaxed),
+                usage_generation_barrier: counters.usage_generation_barrier.load(Ordering::Relaxed),
+                usage_retained_bytes: counters.usage_retained_bytes.load(Ordering::Relaxed),
+                usage_lifetimes_tracked: counters.usage_lifetimes_tracked.load(Ordering::Relaxed),
+                tls_capture_errors: counters.tls_capture_errors.load(Ordering::Relaxed),
+                tls_close_lost: counters.tls_close_lost.load(Ordering::Relaxed),
+                tls_unattributed_drops: counters.tls_unattributed_drops.load(Ordering::Relaxed),
+                tls_lifetimes_swept: counters.tls_lifetimes_swept.load(Ordering::Relaxed),
+                usage_connections_refused: counters
+                    .usage_connections_refused
+                    .load(Ordering::Relaxed),
+                usage_connections_out_of_scope: counters
+                    .usage_connections_out_of_scope
+                    .load(Ordering::Relaxed),
             };
             let json = serde_json::to_string(&resp).unwrap_or_default();
             let _ = writeln!(writer, "{json}");
@@ -609,6 +635,13 @@ fn handle_conn(
             );
         }
         Request::Tail { include_plaintext } => {
+            if include_plaintext {
+                let error = ErrorResponse {
+                    error: "plaintext export is disabled in protocol v2".into(),
+                };
+                let _ = writeln!(writer, "{}", serde_json::to_string(&error).unwrap());
+                return;
+            }
             let (rx, _guard) = subscribers.register(include_plaintext);
             // Block on recv with a periodic wakeup so we can notice
             // shutdown / client disconnect.
@@ -1039,6 +1072,13 @@ mod tests {
             truncated: false,
             read_failed: false,
             ex_variant: false,
+            process_start: 1,
+            exec_generation: 1,
+            connection_generation: 2,
+            call_sequence: 1,
+            loss_epoch: 0,
+            stream_offset: 0,
+            lifecycle_end: false,
             plaintext,
         })
     }
@@ -1048,24 +1088,17 @@ mod tests {
         let evt = make_tls_event(b"hello".to_vec(), 0);
         let line = render_tail_line(&evt, false);
         assert!(!line.contains("plaintext_b64"), "leak: {line}");
-        assert!(line.contains("plaintext_sha256"), "{line}");
+        assert!(!line.contains("plaintext_sha256"), "{line}");
         assert!(line.contains("\"kind\":\"tls.write\""), "{line}");
     }
 
     #[test]
-    fn render_tail_tls_show_plaintext_includes_b64_and_redacts() {
-        let body = b"Authorization: Bearer sk-ant-XXXXXXXXXXXXXXXXXXXXXXX\nbody".to_vec();
-        let evt = make_tls_event(body, 0);
+    fn render_tail_tls_legacy_opt_in_cannot_export_content() {
+        let evt = make_tls_event(b"Authorization: PRIVATE-SENTINEL".to_vec(), 0);
         let line = render_tail_line(&evt, true);
-        assert!(line.contains("plaintext_b64"), "{line}");
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let b64 = v["plaintext_b64"].as_str().unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .unwrap();
-        let s = String::from_utf8_lossy(&decoded);
-        assert!(s.contains("***REDACTED***"), "redaction missing: {s}");
-        assert!(!s.contains("sk-ant-XXX"), "leak in b64: {s}");
+        assert!(!line.contains("plaintext_b64"));
+        assert!(!line.contains("PRIVATE-SENTINEL"));
+        assert!(line.contains("read_failed"));
     }
 
     #[test]
@@ -1076,7 +1109,7 @@ mod tests {
             tgid: 2,
             cgroup_id: 3,
             comm: "x".into(),
-            cmdline: "x --y".into(),
+            _cmdline: "x --y".into(),
         });
         let line = render_tail_line(&evt, false);
         let _: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1131,7 +1164,7 @@ mod tests {
     fn attach_readonly_alongside_writer_works() {
         use crate::store::Store;
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("events.duckdb");
+        let path = dir.path().join("private/events.duckdb");
         // Writer: same code path as production.
         let _writer = Store::open(&path).expect("open writer");
 
@@ -1161,7 +1194,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("events.duckdb");
+        let path = dir.path().join("private/events.duckdb");
         // Populate the DB with one row so the GROUP BY has something.
         let store = Store::open(&path).expect("open store");
         store

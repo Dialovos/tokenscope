@@ -1,350 +1,454 @@
-//! Phase 2.A end-to-end integration test.
-//!
-//! Strategy: spawn tsd with `--track-cgroup` pointing at the test
-//! process's own v2 cgroup (so curl, which the test spawns as a child
-//! and which inherits the same cgroup, fires the TLS uprobes), then:
-//!
-//! 1. Wait for the first `/proc` rescan (~6 s) and confirm
-//!    `tls libs attached >= 1` via `tsctl status`.
-//! 2. Drive a real `curl` against `https://example.com`. After the
-//!    Appender's 1-second flush window, assert
-//!    `events_tls_plaintext` has rows for both directions.
-//! 3. Drive `curl --header "Authorization: Bearer sk-ant-..."` and
-//!    confirm `tsctl tail --show-plaintext` redacts the token while
-//!    `tsctl tail` (no flag) doesn't include the body at all
-//!    (regression guard for codex BLOCKING #6).
-//!
-//! Requires:
-//! - `CAP_BPF` (run via `sudo -E cargo test -p tsd -- --ignored`)
-//! - `curl` on PATH (verified to dynamically link libssl.so.3 on
-//!   Debian/Ubuntu)
-//! - Network access to `https://example.com`
-//!
-//! All tests are `#[ignore]`-gated and skip cleanly if any
-//! prerequisite is missing. They never silently pass.
+//! Privileged OpenSSL qualification with synthetic loopback traffic only.
+//! Build tsd and tsctl first; select this suite inside a dedicated test cgroup.
+//! Selecting an ignored test with missing prerequisites fails explicitly.
 
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use duckdb::Connection;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
 use tempfile::TempDir;
 
-const ATTACH_DEADLINE: Duration = Duration::from_secs(15);
-const STATUS_LINE_PREFIX_TLS_ATTACHED: &str = "tls libs attached";
+const SENTINELS: [&str; 3] = [
+    "PRIVATE-HEADER-SENTINEL",
+    "PRIVATE-PROMPT-SENTINEL",
+    "PRIVATE-RESPONSE-SENTINEL",
+];
+const SERVER: &str = r#"
+import http.server, json, ssl, sys
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        assert self.path == '/v1/chat/completions'
+        assert body == b'{"prompt":"PRIVATE-PROMPT-SENTINEL"}'
+        assert self.headers['Authorization'] == 'Bearer PRIVATE-HEADER-SENTINEL'
+        payload = json.dumps({'choices':[{'content':'PRIVATE-RESPONSE-SENTINEL'}],
+          'usage':{'prompt_tokens':5,'completion_tokens':3,'total_tokens':8}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(payload)))
+        self.send_header('Connection','close')
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self,*args): pass
+server = http.server.HTTPServer(('127.0.0.1',0),Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[1],sys.argv[2])
+context.set_alpn_protocols(['http/1.1'])
+server.socket = context.wrap_socket(server.socket,server_side=True)
+print(server.server_port,flush=True)
+server.serve_forever()
+"#;
 
-fn tsd_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tsd"))
+struct ManagedChild(Child);
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().expect("check child").is_none() {
+            self.0.kill().expect("stop owned child");
+        }
+        self.0.wait().expect("reap owned child");
+    }
 }
-
-fn tsctl_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tsd"))
+fn binary(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_tsd"))
         .parent()
         .unwrap()
-        .join("tsctl")
+        .join(name);
+    assert!(
+        path.is_file(),
+        "build {name} before privileged qualification"
+    );
+    path
 }
-
-fn skip_if_missing_prereqs() -> bool {
-    if which("curl").is_none() {
-        eprintln!("skip: curl not on PATH");
-        return true;
-    }
-    if !std::path::Path::new("/proc/self/cgroup").exists() {
-        eprintln!("skip: /proc/self/cgroup unavailable (not Linux?)");
-        return true;
-    }
-    let tsctl = tsctl_bin();
-    if !tsctl.exists() {
-        // Build it inline so tests don't fail just because someone ran
-        // `cargo test -p tsd --bin tsd` first without -p tsctl.
-        let st = Command::new("cargo")
-            .args(["build", "--bin", "tsctl"])
-            .status();
-        if !matches!(st, Ok(s) if s.success()) {
-            eprintln!("skip: could not build tsctl");
-            return true;
-        }
-    }
-    false
-}
-
-fn which(prog: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(prog);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Read the test process's v2 cgroup path so tsd's filter explicitly
-/// includes us. v2 line shape: `0::/user.slice/...`.
-fn own_cgroup_path() -> Option<PathBuf> {
-    let s = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = s
+fn cgroup() -> PathBuf {
+    let text = std::fs::read_to_string("/proc/self/cgroup").expect("read own cgroup");
+    let relative = text
         .lines()
-        .find_map(|l| l.strip_prefix("0::"))?
-        .trim_end()
-        .to_string();
-    Some(PathBuf::from(format!("/sys/fs/cgroup{rel}")))
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("cgroup v2");
+    let path = PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    assert!(path.is_dir(), "own cgroup must be visible");
+    path
 }
-
-fn spawn_tsd(db: &PathBuf, uds: &PathBuf, track_cgroup: &PathBuf) -> std::process::Child {
-    Command::new(tsd_bin())
-        .args([
-            "--db-path",
-            db.to_str().unwrap(),
-            "--uds-path",
-            uds.to_str().unwrap(),
-            "--track-cgroup",
-            track_cgroup.to_str().unwrap(),
-            "--no-stdout",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn tsd")
+fn status(uds: &Path) -> String {
+    let out = Command::new(binary("tsctl"))
+        .arg("--uds-path")
+        .arg(uds)
+        .arg("status")
+        .output()
+        .expect("status command");
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("UTF-8 status")
 }
-
-fn drain_stderr(child: &mut std::process::Child) -> thread::JoinHandle<String> {
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        buf
-    })
+fn field(text: &str, prefix: &str) -> u64 {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .expect("required status field")
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .expect("numeric status field")
 }
-
-fn wait_for_uds(uds: &PathBuf, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if uds.exists() {
-            return true;
-        }
+fn wait_until(mut condition: impl FnMut() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{message}");
         thread::sleep(Duration::from_millis(100));
     }
-    false
 }
-
-fn read_status(uds: &PathBuf) -> String {
-    let out = Command::new(tsctl_bin())
-        .args(["--uds-path", uds.to_str().unwrap(), "status"])
-        .output()
-        .expect("status");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+struct Fixture {
+    _server: ManagedChild,
+    _directory: TempDir,
+    port: u16,
+    certificate: PathBuf,
 }
-
-fn parse_status_field(status: &str, prefix: &str) -> u64 {
-    status
-        .lines()
-        .find(|l| l.starts_with(prefix))
-        .and_then(|l| l.split_whitespace().last())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
-fn wait_for_attach(uds: &PathBuf) -> u64 {
-    let start = Instant::now();
-    while start.elapsed() < ATTACH_DEADLINE {
-        let n = parse_status_field(&read_status(uds), STATUS_LINE_PREFIX_TLS_ATTACHED);
-        if n >= 1 {
-            return n;
+impl Fixture {
+    fn new() -> Self {
+        let directory = TempDir::new().expect("fixture directory");
+        let certificate = directory.path().join("fixture.pem");
+        let key = directory.path().join("fixture-key.pem");
+        let out = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&certificate)
+            .output()
+            .expect("openssl prerequisite");
+        assert!(
+            out.status.success(),
+            "fixture certificate generation failed"
+        );
+        let mut server = ManagedChild(
+            Command::new("python3")
+                .args(["-u", "-c", SERVER])
+                .arg(&certificate)
+                .arg(&key)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Python TLS fixture"),
+        );
+        let stdout = server.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("fixture port");
+            tx.send(line).expect("fixture receiver");
+        });
+        let port = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fixture startup deadline")
+            .trim()
+            .parse()
+            .expect("numeric port");
+        Self {
+            _server: server,
+            _directory: directory,
+            port,
+            certificate,
         }
-        thread::sleep(Duration::from_millis(500));
     }
-    0
+    fn request(&self) -> u32 {
+        // No DNS or provider request: both TLS endpoints are on loopback.
+        let child = Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--http1.1",
+                "--noproxy",
+                "*",
+                "--max-time",
+                "10",
+            ])
+            .arg("--cacert")
+            .arg(&self.certificate)
+            .arg("--resolve")
+            .arg(format!("localhost:{}:127.0.0.1", self.port))
+            .args([
+                "-H",
+                "Host: api.openai.com",
+                "-H",
+                "Authorization: Bearer PRIVATE-HEADER-SENTINEL",
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                r#"{"prompt":"PRIVATE-PROMPT-SENTINEL"}"#,
+            ])
+            .arg(format!(
+                "https://localhost:{}/v1/chat/completions",
+                self.port
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("curl prerequisite");
+        let pid = child.id();
+        let out = child.wait_with_output().expect("fixture request");
+        assert!(
+            out.status.success(),
+            "loopback request failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("fixture JSON");
+        assert_eq!(body["usage"]["total_tokens"], 8);
+        assert_eq!(body["choices"][0]["content"], SENTINELS[2]);
+        pid
+    }
 }
-
-#[test]
-#[ignore = "requires CAP_BPF + curl + network; run with sudo -E cargo test -p tsd -- --ignored"]
-fn tls_attaches_to_libssl_within_one_rescan() {
-    if skip_if_missing_prereqs() {
-        return;
-    }
-    let cgroup = match own_cgroup_path() {
-        Some(p) if p.exists() => p,
-        _ => {
-            eprintln!("skip: own_cgroup_path missing or not a v2 directory");
-            return;
+struct Daemon {
+    child: ManagedChild,
+    _directory: TempDir,
+    db: PathBuf,
+    uds: PathBuf,
+    logs: Option<thread::JoinHandle<String>>,
+}
+impl Daemon {
+    fn new() -> Self {
+        let directory = TempDir::new().expect("daemon directory");
+        let db = directory.path().join("private/usage.duckdb");
+        let uds = directory.path().join("tsd.sock");
+        let mut child = ManagedChild(
+            Command::new(binary("tsd"))
+                .arg("--db-path")
+                .arg(&db)
+                .arg("--uds-path")
+                .arg(&uds)
+                .arg("--track-cgroup")
+                .arg(cgroup())
+                .arg("--no-stdout")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        let mut stderr = child.0.stderr.take().unwrap();
+        let logs = thread::spawn(move || {
+            let mut text = String::new();
+            stderr.read_to_string(&mut text).expect("daemon logs");
+            text
+        });
+        let mut exited = None;
+        wait_until(
+            || {
+                exited = child.0.try_wait().expect("daemon state");
+                exited.is_some() || uds.exists()
+            },
+            "daemon did not create control socket",
+        );
+        if let Some(status) = exited {
+            let text = logs.join().unwrap_or_default();
+            panic!("daemon exited before qualification ({status}):\n{text}");
         }
-    };
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("e.duckdb");
-    let uds = dir.path().join("tsd.sock");
-
-    let mut child = spawn_tsd(&db, &uds, &cgroup);
-    let stderr = drain_stderr(&mut child);
-    if !wait_for_uds(&uds, Duration::from_secs(10)) {
-        let _ = child.kill();
-        panic!(
-            "tsd never opened the UDS — stderr: {}",
-            stderr.join().unwrap_or_default()
+        wait_until(
+            || field(&status(&uds), "tls libs attached") > 0,
+            "libssl attachment did not qualify",
+        );
+        Self {
+            child,
+            _directory: directory,
+            db,
+            uds,
+            logs: Some(logs),
+        }
+    }
+    fn stop(&mut self) -> String {
+        assert_eq!(
+            unsafe { libc::kill(self.child.0.id() as i32, libc::SIGINT) },
+            0
+        );
+        let mut exit = None;
+        wait_until(
+            || {
+                exit = self.child.0.try_wait().expect("daemon shutdown");
+                exit.is_some()
+            },
+            "daemon did not drain and stop",
+        );
+        let logs = self.logs.take().unwrap().join().expect("daemon log reader");
+        assert!(exit.unwrap().success(), "daemon shutdown failed: {logs}");
+        logs
+    }
+}
+/// Metadata-only view of what the daemon stored: usage states and reasons, and
+/// TLS call counts per process and direction. No content or headers.
+fn capture_summary(conn: &Connection) -> String {
+    let mut out = String::from("events_usage (tgid, ordinal, state, integrity, reason):\n");
+    let mut rows = conn
+        .prepare(
+            "SELECT tgid, request_ordinal, usage_state, capture_integrity, coalesce(reason, '') \
+             FROM events_usage ORDER BY ts_ns",
+        )
+        .unwrap();
+    let usage = rows
+        .query_map([], |r| {
+            Ok(format!(
+                "  {} {:?} {} {} {}",
+                r.get::<_, u32>(0)?,
+                r.get::<_, Option<u64>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?
+            ))
+        })
+        .unwrap();
+    for line in usage {
+        out.push_str(&line.unwrap());
+        out.push('\n');
+    }
+    out.push_str("events_tls_metadata (tgid, direction, chunks, max sequence, loss, ends):\n");
+    let mut rows = conn
+        .prepare(
+            "SELECT tgid, direction, count(*), max(call_sequence), max(loss_epoch), \
+             count(*) FILTER (WHERE lifecycle_end) FROM events_tls_metadata \
+             GROUP BY tgid, direction ORDER BY tgid, direction",
+        )
+        .unwrap();
+    let calls = rows
+        .query_map([], |r| {
+            Ok(format!(
+                "  {} {} {} {} {} {}",
+                r.get::<_, u32>(0)?,
+                r.get::<_, u8>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, u64>(3)?,
+                r.get::<_, u64>(4)?,
+                r.get::<_, i64>(5)?
+            ))
+        })
+        .unwrap();
+    for line in calls {
+        out.push_str(&line.unwrap());
+        out.push('\n');
+    }
+    out
+}
+fn assert_private(text: &[u8]) {
+    for sentinel in SENTINELS {
+        assert!(
+            !text
+                .windows(sentinel.len())
+                .any(|w| w == sentinel.as_bytes()),
+            "persistent/export surface leaked a sentinel"
         );
     }
-
-    // First /proc rescan happens immediately at startup; subsequent
-    // every 5s. Anything libssl-mapping in the cgroup at that moment
-    // counts. The test binary itself links libssl via duckdb→reqwest,
-    // so we should see >= 1.
-    let n = wait_for_attach(&uds);
-    let status = read_status(&uds);
-    eprintln!("--- status ---\n{status}");
-    assert!(
-        n >= 1,
-        "expected tls libs attached >= 1 within {ATTACH_DEADLINE:?}; status:\n{status}"
-    );
-
-    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    let _ = child.wait();
 }
-
 #[test]
-#[ignore = "requires CAP_BPF + curl + network; run with sudo -E cargo test -p tsd -- --ignored"]
-fn tls_curl_emits_chunks_and_rows_in_db() {
-    if skip_if_missing_prereqs() {
-        return;
-    }
-    let cgroup = match own_cgroup_path() {
-        Some(p) if p.exists() => p,
-        _ => {
-            eprintln!("skip: own_cgroup_path missing");
-            return;
-        }
+#[ignore = "requires root, curl, OpenSSL, Python and a dedicated test cgroup"]
+fn tls_attaches_to_libssl_within_one_rescan() {
+    let _fixture = Fixture::new();
+    let mut daemon = Daemon::new();
+    assert!(field(&status(&daemon.uds), "tls libs attached") >= 1);
+    assert_private(daemon.stop().as_bytes());
+}
+#[test]
+#[ignore = "requires root, curl, OpenSSL, Python and a dedicated test cgroup"]
+fn tls_curl_emits_metadata_and_exact_reported_usage() {
+    let fixture = Fixture::new();
+    let mut daemon = Daemon::new();
+    let pid = fixture.request();
+    wait_until(
+        || field(&status(&daemon.uds), "rows flushed") > 0,
+        "fixture rows were not flushed",
+    );
+    let logs = daemon.stop();
+    assert_private(logs.as_bytes());
+    let conn = Connection::open(&daemon.db).expect("inspect fixture database");
+    let reports: String = match conn.query_row(
+        "SELECT reports_json FROM events_usage WHERE tgid=? AND usage_state='reported' AND request_ordinal=1",
+        [pid],
+        |r| r.get(0),
+    ) {
+        Ok(reports) => reports,
+        Err(e) => panic!(
+            "exact client usage must qualify ({e}); curl pid {pid}\n{}\ndaemon log:\n{logs}",
+            capture_summary(&conn)
+        ),
     };
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("e.duckdb");
-    let uds = dir.path().join("tsd.sock");
-
-    let mut child = spawn_tsd(&db, &uds, &cgroup);
-    let _stderr = drain_stderr(&mut child);
-    assert!(
-        wait_for_uds(&uds, Duration::from_secs(10)),
-        "tsd never opened uds"
-    );
-    assert!(
-        wait_for_attach(&uds) >= 1,
-        "tsd never attached to libssl"
-    );
-
-    // Drive a TLS call. curl on Debian/Ubuntu links libssl.so.3.
-    let curl_status = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "https://example.com/",
-        ])
-        .status()
-        .expect("spawn curl");
-    if !curl_status.success() {
-        eprintln!("skip: curl failed (no network?) status={curl_status}");
-        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-        let _ = child.wait();
-        return;
+    let counts: serde_json::Value = serde_json::from_str(&reports).unwrap();
+    assert_eq!(counts[0]["input"], 5);
+    assert_eq!(counts[0]["output"], 3);
+    assert_eq!(counts[0]["total"], 8);
+    for direction in [0, 1] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events_tls_metadata WHERE tgid=? AND direction=?",
+                duckdb::params![pid, direction],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n > 0, "missing client TLS direction {direction}");
     }
-
-    // Wait past the Appender's 1s flush + a margin.
-    thread::sleep(Duration::from_secs(2));
-
-    let q = Command::new(tsctl_bin())
-        .args([
-            "--uds-path",
-            uds.to_str().unwrap(),
-            "query",
-            "SELECT direction, COUNT(*), SUM(chunk_bytes) FROM events_tls_plaintext GROUP BY 1 ORDER BY 1",
-        ])
+    let raw:i64=conn.query_row("SELECT count(*) FROM information_schema.tables WHERE table_name='events_tls_plaintext'",[],|r|r.get(0)).unwrap();
+    assert_eq!(raw, 0);
+    drop(conn);
+    assert_private(&std::fs::read(&daemon.db).unwrap());
+}
+#[test]
+#[ignore = "requires root, curl, OpenSSL, Python and a dedicated test cgroup"]
+fn tls_default_tail_is_private_and_plaintext_requests_are_refused() {
+    let fixture = Fixture::new();
+    let mut daemon = Daemon::new();
+    let refused = Command::new(binary("tsctl"))
+        .arg("--uds-path")
+        .arg(&daemon.uds)
+        .args(["tail", "--show-plaintext"])
         .output()
-        .expect("query");
-    let qout = String::from_utf8_lossy(&q.stdout).into_owned();
-    eprintln!("--- query ---\n{qout}");
-    assert!(q.status.success(), "query failed: {qout}");
-    // Both directions should have at least one row each.
-    assert!(qout.contains("0"), "no write rows: {qout}");
-    assert!(qout.contains("1"), "no read rows: {qout}");
-
-    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    let _ = child.wait();
-}
-
-#[test]
-#[ignore = "requires CAP_BPF + curl + network; run with sudo -E cargo test -p tsd -- --ignored"]
-fn tls_default_tail_does_not_leak_authorization_header() {
-    if skip_if_missing_prereqs() {
-        return;
-    }
-    let cgroup = match own_cgroup_path() {
-        Some(p) if p.exists() => p,
-        _ => {
-            eprintln!("skip: own_cgroup_path missing");
-            return;
-        }
-    };
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("e.duckdb");
-    let uds = dir.path().join("tsd.sock");
-
-    let mut child = spawn_tsd(&db, &uds, &cgroup);
-    let _stderr = drain_stderr(&mut child);
-    assert!(wait_for_uds(&uds, Duration::from_secs(10)));
-    assert!(wait_for_attach(&uds) >= 1);
-
-    // Open `tsctl tail` (NO --show-plaintext) and capture stdout.
-    let tail_uds = uds.clone();
-    let tail_handle = thread::spawn(move || {
-        let tail = Command::new(tsctl_bin())
-            .args(["--uds-path", tail_uds.to_str().unwrap(), "tail"])
+        .expect("plaintext request");
+    assert!(
+        !refused.status.success(),
+        "plaintext export must be refused"
+    );
+    let mut tail = ManagedChild(
+        Command::new(binary("tsctl"))
+            .arg("--uds-path")
+            .arg(&daemon.uds)
+            .arg("tail")
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .expect("tail spawn");
-        thread::sleep(Duration::from_millis(3500));
-        unsafe { libc::kill(tail.id() as i32, libc::SIGINT) };
-        let out = tail.wait_with_output().expect("tail wait");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+            .expect("tail"),
+    );
+    let mut stdout = tail.0.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut text = Vec::new();
+        stdout.read_to_end(&mut text).expect("tail output");
+        text
     });
-    thread::sleep(Duration::from_millis(300));
-
-    // Drive a TLS call carrying the magic header. The header value
-    // shouldn't appear anywhere in default tail output (regression
-    // guard for codex BLOCKING #6).
-    const MAGIC: &str = "sk-ant-MAGIC-DO-NOT-LEAK-12345-XYZ";
-    let curl_status = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "-H",
-            &format!("Authorization: Bearer {MAGIC}"),
-            "https://example.com/",
-        ])
-        .status()
-        .expect("spawn curl");
-    if !curl_status.success() {
-        eprintln!("skip: curl failed (no network?)");
-        let _ = tail_handle.join();
-        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-        let _ = child.wait();
-        return;
-    }
-
-    let captured = tail_handle.join().unwrap();
-    eprintln!("--- captured tail (default) ---\n{captured}");
-    assert!(
-        !captured.contains(MAGIC),
-        "default tail leaked the magic token; this is codex BLOCKING #6 regressing"
+    wait_until(
+        || field(&status(&daemon.uds), "tail subscribers") >= 1,
+        "tail did not register",
     );
-    // We do expect to see SOME tls.write line for the curl call.
+    fixture.request();
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { libc::kill(tail.0.id() as i32, libc::SIGINT) }, 0);
+    let captured = reader.join().expect("tail reader");
+    assert_private(&captured);
+    let text = String::from_utf8(captured).unwrap();
     assert!(
-        captured.contains("\"kind\":\"tls.write\""),
-        "default tail saw no tls.write at all — attachment may have failed:\n{captured}"
+        text.contains("\"kind\":\"tls.write\""),
+        "no positive TLS tail control"
     );
-
-    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    let _ = child.wait();
+    assert!(!text.contains("\"plaintext\"") && !text.contains("\"cmdline\""));
+    assert_private(daemon.stop().as_bytes());
 }
