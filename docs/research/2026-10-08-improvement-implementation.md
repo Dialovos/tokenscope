@@ -486,3 +486,16 @@ are formatting. After committing this work, merge `origin/main`; for
 cleanly and carries the kernel 7.0 fix to `main`. Then rerun the checks
 above. `experiments/results/` stays out of Git: repo-guard blocks result files
 as generated artifacts, and the ablation output regenerates deterministically.
+
+## Merged — 2026-10-16
+
+Merged into `main` as PR #2 (`3e983b0`). The remote CI workflow ran on the
+Ubuntu 22.04 and 24.04 runners and passed: fmt, clippy, build, 117
+unprivileged tests and all 10 privileged tests as root, including the three
+TLS tests. That adds two runner kernels to the local 7.0 qualification; the
+workflow does not log their versions.
+
+Still not verified: the CO-RE fallback for kernels without `bpf_get_func_ret`
+(5.15/5.16), real-provider reconciliation, overhead, crash recovery and
+power-loss durability. The open research items are in the
+[ablation note](2026-10-15-loss-recovery-ablation.md#next).

@@ -25,9 +25,9 @@ Rust skeletons embedded in the binaries.
 
 ## Current draft — reported usage, 2026-10-15
 
-Uncommitted on `research/accounting-validation`. Unprivileged checks and all
-ten privileged tests pass locally on kernel 7.0 with OpenSSL 3.5, including
-exact 5/3/8 usage from a real curl exchange. The supported path is
+Merged on 2026-10-16 (PR #2). Unprivileged checks and all ten privileged tests
+pass on kernel 7.0 with OpenSSL 3.5, including exact 5/3/8 usage from a real
+curl exchange, and on the Ubuntu 22.04 and 24.04 CI runners. The supported path is
 dynamically linked OpenSSL, HTTP/1.1, `POST /v1/chat/completions` with Host
 `api.openai.com` (optionally port 443), and JSON or SSE responses. Association
 follows observed request order. HTTP/2, compressed and close-delimited bodies
