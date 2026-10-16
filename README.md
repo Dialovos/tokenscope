@@ -4,9 +4,10 @@ Linux eBPF observability for LLM workloads. The current usage-monitor draft
 reconstructs reported token counts from dynamically linked OpenSSL traffic on a
 narrow HTTP/1.1 path, alongside process and network metadata.
 
-> Status: pre-alpha, uncommitted. Reviewed and reworked on 2026-10-15. The
-> unprivileged suite and all ten privileged tests pass locally (kernel 7.0,
-> OpenSSL 3.5); remote CI has not run this tree. HTTP/1.1 Chat Completions JSON/SSE parsing streams instead of buffering,
+> Status: pre-alpha. The reported-usage monitor merged on 2026-10-16 (PR #2).
+> The unprivileged suite and all ten privileged tests pass on kernel 7.0 locally
+> and on the Ubuntu 22.04 and 24.04 CI runners. HTTP/1.1 Chat Completions
+> JSON/SSE parsing streams instead of buffering,
 > loss is sized by per-direction byte offsets, and recovery keeps keep-alive
 > connections useful after a loss. Storage and tail carry metadata and numbers only.
 > None of this establishes complete token accounting, HTTP/2 support or billing
@@ -122,13 +123,17 @@ test kernel and is not launched by the host script.
 ten-seed Go and Python matrices sequentially. The launchers share a lock to
 prevent overlapping observer jobs. Allow about 1.5 hours without GPU inference.
 
-[Technical-report PDF](experiments/results/accounting-manuscript.pdf) and
-[main study artifact](experiments/results/2026-09-29-accounting-main-artifact.tar.gz)
+The technical-report PDF (`experiments/results/accounting-manuscript.pdf`) and
+main study artifact (`experiments/results/2026-09-29-accounting-main-artifact.tar.gz`)
 contain the working report, figures, reproduction scripts, exact measured source
 snapshots and portable accounting evidence. Author/Claude review and venue
 selection remain pending; nothing has been uploaded. Earlier draft/screen
 archives remain as historical snapshots. This evidence supports a scoped
 technical report; a new-method paper needs additional mechanism and validation.
+
+Files under `experiments/results/` are generated artifacts and stay out of Git
+(repo-guard blocks them), so the result links in the research documents only
+resolve in the maintainer's checkout. They are archived separately.
 
 ## History
 
