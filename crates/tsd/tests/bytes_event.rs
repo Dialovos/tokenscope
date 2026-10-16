@@ -7,6 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,23 @@ fn captures_tcp_byte_counts() {
         .expect("spawn tsd");
 
     let stdout = child.stdout.take().expect("pipe stdout");
-    let mut reader = BufReader::new(stdout);
+    let mut stderr = child.stderr.take().expect("pipe stderr");
+    // Read both pipes on their own threads: a blocking read_line can't honor
+    // the deadline below, and an undrained stderr pipe stalls tsd once full.
+    let (lines_tx, lines_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
 
     thread::sleep(Duration::from_millis(700));
 
@@ -46,12 +63,9 @@ fn captures_tcp_byte_counts() {
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut saw_event = false;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) if line.contains("NetBytes") => {
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match lines_rx.recv_timeout(left) {
+            Ok(line) if line.contains("NetBytes") => {
                 if let Some(tx) = parse_field_u64(&line, "tx: ") {
                     if tx >= PAYLOAD.len() as u64 {
                         saw_event = true;
@@ -61,17 +75,20 @@ fn captures_tcp_byte_counts() {
                 }
             }
             Ok(_) => continue,
+            // Timed out, or tsd closed stdout.
             Err(_) => break,
         }
     }
 
     let _ = child.kill();
     let _ = child.wait();
+    let tsd_stderr = stderr_reader.join().unwrap_or_default();
 
     assert!(
         saw_event,
-        "tsd produced no NetBytes line with tx >= {} within 3s",
-        PAYLOAD.len()
+        "tsd produced no NetBytes line with tx >= {} within 3s; tsd stderr:\n{}",
+        PAYLOAD.len(),
+        tsd_stderr
     );
 }
 
