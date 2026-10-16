@@ -13,17 +13,14 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly. Server includes
 /// it in `StatusResponse` so clients can warn on mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Status,
     Tail {
-        /// Phase 2.A opt-in: when true, the server includes decrypted
-        /// TLS plaintext bytes (with redaction) inline in tail frames
-        /// for THIS subscriber. Default false keeps the wire shape of
-        /// `{"op":"tail"}` from older tsctl backward-compatible.
+        /// Legacy option: protocol v2 rejects true. No plaintext is exported.
         #[serde(default)]
         include_plaintext: bool,
     },
@@ -75,6 +72,42 @@ pub struct StatusResponse {
     pub tls_scan_errors: u32,
     #[serde(default)]
     pub tls_subscribers_with_plaintext: u32,
+    #[serde(default)]
+    pub writer_healthy: bool,
+    #[serde(default)]
+    pub capture_epoch: String,
+    #[serde(default)]
+    pub persistence_errors: u64,
+    #[serde(default)]
+    pub rows_flushed: u64,
+    #[serde(default)]
+    pub writer_events_processed: u64,
+    #[serde(default)]
+    pub tls_map_failures: u64,
+    #[serde(default)]
+    pub tls_missing_states: u64,
+    #[serde(default)]
+    pub tls_outparam_failures: u64,
+    #[serde(default)]
+    pub usage_admission_blocked: bool,
+    #[serde(default)]
+    pub usage_generation_barrier: u64,
+    #[serde(default)]
+    pub usage_retained_bytes: u64,
+    #[serde(default)]
+    pub usage_lifetimes_tracked: u64,
+    #[serde(default)]
+    pub tls_capture_errors: u64,
+    #[serde(default)]
+    pub tls_close_lost: u64,
+    #[serde(default)]
+    pub tls_unattributed_drops: u64,
+    #[serde(default)]
+    pub tls_lifetimes_swept: u64,
+    #[serde(default)]
+    pub usage_connections_refused: u64,
+    #[serde(default)]
+    pub usage_connections_out_of_scope: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,6 +255,24 @@ mod tests {
             tls_scan_duration_us: 4321,
             tls_scan_errors: 0,
             tls_subscribers_with_plaintext: 1,
+            writer_healthy: true,
+            capture_epoch: "test-epoch".into(),
+            persistence_errors: 0,
+            rows_flushed: 0,
+            writer_events_processed: 0,
+            tls_map_failures: 0,
+            tls_missing_states: 0,
+            tls_outparam_failures: 0,
+            usage_admission_blocked: false,
+            usage_generation_barrier: 0,
+            usage_retained_bytes: 0,
+            usage_lifetimes_tracked: 0,
+            tls_capture_errors: 0,
+            tls_close_lost: 0,
+            tls_unattributed_drops: 0,
+            tls_lifetimes_swept: 0,
+            usage_connections_refused: 0,
+            usage_connections_out_of_scope: 0,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: StatusResponse = serde_json::from_str(&s).unwrap();

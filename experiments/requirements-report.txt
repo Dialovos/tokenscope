@@ -1,0 +1,5 @@
+matplotlib==3.11.2
+reportlab==5.0.1
+Markdown==3.11
+pypdf==6.19.0
+pypdfium2==5.13.0

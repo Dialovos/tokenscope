@@ -14,3 +14,10 @@ vmlinux/btf-cache/
 *.duckdb
 *.duckdb.wal
 /data/
+# Project-local Python environment for research experiments
+/.venv/
+**/__pycache__/
+/experiments/.cache/
+/experiments/runs/
+# Generated results stay out of Git (repo-guard blocks them); regenerate or archive separately
+/experiments/results/

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "fetched_at_utc": "2026-09-29T21:17:19.393211+00:00",
+  "hash_verification": "GitHub release asset digest; no Sigstore signature claim",
+  "baselines": {
+    "obi": {
+      "repository": "https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation",
+      "tag": "v0.13.0",
+      "source_commit": "3cc19862cef1abdaaeaa2a6387b462d31822010e",
+      "asset": "obi-v0.13.0-linux-amd64.tar.gz",
+      "asset_url": "https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/releases/download/v0.13.0/obi-v0.13.0-linux-amd64.tar.gz",
+      "archive_sha256": "22221e566b06f85b4f02b9eb7a08dbf5b128aef0ffdd47c18f073a1d727d073a",
+      "binary_sha256": "aee0bb0251c57461882d9d166da09c792744d5e1f0c0285f00be1eb1347bd0cb",
+      "binary": "experiments/.cache/baselines/obi/obi"
+    },
+    "agtap": {
+      "repository": "https://github.com/zhebrak/agtap",
+      "tag": "v0.1.0",
+      "source_commit": "1ad473cd78d3803a729fb4aa8018ef09a426060c",
+      "asset": "agtap-v0.1.0-linux-x86_64.tar.gz",
+      "asset_url": "https://github.com/zhebrak/agtap/releases/download/v0.1.0/agtap-v0.1.0-linux-x86_64.tar.gz",
+      "archive_sha256": "2ed0e4894852114b1ee1d29ed6bd7075757ce1e94057463da2a8ec6fc03aa53a",
+      "binary_sha256": "f04efad68ed599e7e28b089cb2ef5fff011de3359f844b0d7d885ba073fc99be",
+      "binary": "experiments/.cache/baselines/agtap/agtap"
+    }
+  }
+}

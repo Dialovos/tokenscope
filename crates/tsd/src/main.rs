@@ -10,13 +10,13 @@
 mod cgroup;
 mod control;
 mod net_bytes;
+#[cfg(test)]
 mod proc_cache;
 mod sink;
 mod skeletons;
 mod store;
 mod tls;
 
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -28,11 +28,10 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use ts_bpf_sys::libbpf_rs::RingBufferBuilder;
+use ts_bpf_sys::libbpf_rs::{ErrorKind, RingBufferBuilder};
 use ts_core::{decode_header, decode_net_connect, TsEventType};
 
 use crate::control::{Counters, Subscribers};
-use crate::proc_cache::ProcessCache;
 use crate::sink::{EventEnvelope, EventSink, NetConnectEvent, ProcExecEvent};
 use crate::skeletons::{load_all, LoadedSkels, SkelStorage};
 use crate::store::Store;
@@ -77,7 +76,7 @@ fn default_db_path() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
         .unwrap_or_else(|| PathBuf::from("/var/lib"));
-    base.join("tokenscope").join("events.duckdb")
+    base.join("tokenscope").join("usage.duckdb")
 }
 
 fn main() -> Result<()> {
@@ -135,7 +134,6 @@ fn main() -> Result<()> {
         "BPF programs attached"
     );
 
-    let cache = RefCell::new(ProcessCache::new());
     let store = Store::open(&args.db_path).context("open DuckDB store")?;
     let stdout_enabled = !args.no_stdout;
 
@@ -171,7 +169,8 @@ fn main() -> Result<()> {
     // thread. Producers (ringbuf consumer + net_bytes flush) push
     // `EventEnvelope`s via `events_tx` instead of touching Store /
     // Subscribers directly. See `crates/tsd/src/sink.rs`.
-    let event_sink = EventSink::spawn(store, subscribers.clone()).context("spawn EventSink")?;
+    let event_sink = EventSink::spawn(store, subscribers.clone(), counters.clone())
+        .context("spawn EventSink")?;
     let events_tx = event_sink.tx.clone();
 
     // TLS state lives for the daemon's life and is driven from the
@@ -183,12 +182,12 @@ fn main() -> Result<()> {
     let mut builder = RingBufferBuilder::new();
     builder
         .add(&skels.sched.maps.events, |data| {
-            handle_event(data, &cache, &events_tx, &counters, stdout_enabled)
+            handle_event(data, &events_tx, &counters, stdout_enabled)
         })
         .map_err(|e| anyhow!("add sched ringbuf: {e}"))?;
     builder
         .add(&skels.net.maps.events, |data| {
-            handle_event(data, &cache, &events_tx, &counters, stdout_enabled)
+            handle_event(data, &events_tx, &counters, stdout_enabled)
         })
         .map_err(|e| anyhow!("add net ringbuf: {e}"))?;
     builder
@@ -199,21 +198,28 @@ fn main() -> Result<()> {
     let ringbuf = builder.build().map_err(|e| anyhow!("build ringbuf: {e}"))?;
 
     let flush_interval = Duration::from_millis(args.flush_interval_ms);
+    let mut inventory = crate::tls::Inventory::default();
     let mut last_flush = Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
+        // A signal (shutdown included) interrupts the wait; nothing was consumed
+        // and the records stay in the ring, so that is not capture loss.
         if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
             error!(?e, "ringbuf poll error");
             counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
+            counters.tls_capture_errors.fetch_add(1, Ordering::Relaxed);
         }
         if last_flush.elapsed() >= flush_interval {
             net_bytes::flush(
                 &skels.net.maps.net_bytes,
-                &cache,
                 &events_tx,
                 &counters,
                 stdout_enabled,
             );
+            inventory.checkpoint(skels, &events_tx, &counters, false);
             last_flush = Instant::now();
         }
         // TLS discovery is a no-op until its 5s deadline.
@@ -223,32 +229,47 @@ fn main() -> Result<()> {
     info!("shutting down — flushing once and closing");
     net_bytes::flush(
         &skels.net.maps.net_bytes,
-        &cache,
         &events_tx,
         &counters,
         stdout_enabled,
     );
     // Explicit drop ordering for the new sink:
-    //   1. ringbuf — releases closure borrows on &cache / &counters /
+    //   1. ringbuf — releases closure borrows on &counters /
     //      events_tx so the local `events_tx` can be moved/dropped.
     //   2. local events_tx — the cloned tx inside event_sink still
     //      keeps the channel alive; we drop ours so we don't hold an
     //      extra reference past the sink's own lifetime.
-    //   3. event_sink — Drop flips its shutdown flag, joins the
-    //      writer thread (which closes the DuckDB Connection on its
-    //      way out).
+    //   3. event_sink — sends a FIFO stop marker, drains and flushes,
+    //      then joins the writer and closes the DuckDB connection.
     //   4. _control_server — its Drop flips its own shutdown, joins
     //      the listener, removes the socket file.
     //   5. subscribers / counters — Arcs go to zero.
+    let tls_disable_result = tls_state.disable_capture(skels);
+    if let Err(error) = &tls_disable_result {
+        error!(?error, "disable TLS capture before detaching links");
+        // Capture-control loss has no lifetime: every open lifetime loses trust.
+        counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
+        counters.tls_capture_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(tls_state);
+    // If gating failed, do not ingest records emitted during partial detach.
+    // Previously accepted writer events still drain below.
+    // Drain without waiting: a non-blocking consume cannot be interrupted.
+    if tls_disable_result.is_ok() && ringbuf.consume().is_err() {
+        counters.ringbuf_poll_errors.fetch_add(1, Ordering::Relaxed);
+        counters.tls_capture_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    // Capture stopped and the ring drained: the final inventories are exact.
+    inventory.checkpoint(skels, &events_tx, &counters, true);
     drop(ringbuf);
     drop(events_tx);
-    drop(event_sink);
+    event_sink.finish()?;
+    tls_disable_result.context("disable TLS capture during shutdown")?;
     Ok(())
 }
 
 fn handle_event(
     data: &[u8],
-    cache: &RefCell<ProcessCache>,
     events_tx: &SyncSender<EventEnvelope>,
     counters: &Counters,
     stdout: bool,
@@ -265,16 +286,13 @@ fn handle_event(
     let payload = &data[std::mem::size_of::<ts_core::TsEventHdr>()..];
 
     let comm = hdr.comm_str();
-    let cmdline = {
-        let mut cache_mut = cache.borrow_mut();
-        cache_mut.get_or_load(hdr.tgid).display_cmdline()
-    };
+    // Arguments can contain secrets. Do not collect them for events.
 
     match kind {
         Some(TsEventType::ProcExec) => {
             if stdout {
                 println!(
-                    "TsEventHdr {{ kind: ProcExec, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cmdline: {cmdline:?}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts} }}",
+                    "TsEventHdr {{ kind: ProcExec, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cpu: {cpu}, cgroup_id: {cgid:#x}, ts_ns: {ts} }}",
                     pid = hdr.pid,
                     tgid = hdr.tgid,
                     cpu = hdr.cpu,
@@ -294,7 +312,7 @@ fn handle_event(
                     tgid: hdr.tgid,
                     cgroup_id: hdr.cgroup_id,
                     comm,
-                    cmdline,
+                    _cmdline: String::new(),
                 }))
             {
                 counters.sink_dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -305,7 +323,7 @@ fn handle_event(
             Ok(pl) => {
                 if stdout {
                     println!(
-                        "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, comm: {comm:?}, cmdline: {cmdline:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
+                        "TsEventHdr {{ kind: NetConnect, pid: {pid}, tgid: {tgid}, comm: {comm:?}, dst: {dst}, proto: {proto}, cgroup_id: {cgid:#x} }}",
                         pid = hdr.pid,
                         tgid = hdr.tgid,
                         dst = pl.dst_string(),
@@ -320,7 +338,7 @@ fn handle_event(
                         tgid: hdr.tgid,
                         cgroup_id: hdr.cgroup_id,
                         comm,
-                        cmdline,
+                        _cmdline: String::new(),
                         dst_addr: pl.dst_addr,
                         dst_port: pl.dst_port,
                         family: pl.family,

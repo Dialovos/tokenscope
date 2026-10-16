@@ -1,13 +1,12 @@
-//! TokenScope CLI (Phase 1.F).
+//! TokenScope CLI.
 //!
-//! Two commands today:
+//! Commands:
 //!   tsctl status               # one-shot daemon snapshot
 //!   tsctl tail                 # live JSON event stream until Ctrl-C
+//!   tsctl query <SQL>          # read-only query through the daemon
 //!
-//! Both talk to tsd over a Unix domain socket. `tsctl query` lands in
-//! Phase 1.G — DuckDB does not allow concurrent reader+writer across
-//! processes, so query has to be routed through the daemon's own
-//! connection.
+//! All talk to tsd over a Unix domain socket. Queries use an in-memory
+//! connection with a read-only attachment inside the daemon process.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -40,9 +39,7 @@ enum Cmd {
     Status,
     /// Live event stream from tsd. Exits on SIGINT.
     Tail {
-        /// Include decrypted TLS plaintext bytes inline (with redaction).
-        /// Without this flag, TLS records render as metadata + sha256
-        /// prefix only.
+        /// Legacy flag; protocol v2 refuses plaintext export.
         #[arg(long)]
         show_plaintext: bool,
     },
@@ -99,6 +96,7 @@ fn cmd_status(uds_path: &PathBuf) -> Result<()> {
     println!("tsd version            {}", resp.version);
     println!("protocol version       {}", resp.protocol_version);
     println!("uptime (s)             {}", resp.uptime_s);
+    println!("capture epoch          {}", resp.capture_epoch);
     println!("db path                {}", resp.db_path);
     println!("uds path               {}", resp.uds_path);
     println!("probes                 {}", resp.probes_attached.join(", "));
@@ -115,6 +113,26 @@ fn cmd_status(uds_path: &PathBuf) -> Result<()> {
     println!("tls read failed chunks {}", resp.tls_read_failed_chunks);
     println!("tls inflight collisions {}", resp.tls_inflight_collisions);
     println!("tls reserve failures   {}", resp.tls_reserve_failures);
+    println!("tls map failures       {}", resp.tls_map_failures);
+    println!("tls missing states     {}", resp.tls_missing_states);
+    println!("tls outparam failures  {}", resp.tls_outparam_failures);
+    println!("writer healthy         {}", resp.writer_healthy);
+    println!("usage at lifetime limit {}", resp.usage_admission_blocked);
+    println!("usage generation barrier {}", resp.usage_generation_barrier);
+    println!("usage retained bytes   {}", resp.usage_retained_bytes);
+    println!("usage lifetimes tracked {}", resp.usage_lifetimes_tracked);
+    println!("usage refused lifetimes {}", resp.usage_connections_refused);
+    println!(
+        "usage other-origin lifetimes {}",
+        resp.usage_connections_out_of_scope
+    );
+    println!("tls capture errors     {}", resp.tls_capture_errors);
+    println!("tls closures lost      {}", resp.tls_close_lost);
+    println!("tls unattributed drops {}", resp.tls_unattributed_drops);
+    println!("tls lifetimes swept    {}", resp.tls_lifetimes_swept);
+    println!("persistence errors     {}", resp.persistence_errors);
+    println!("rows flushed           {}", resp.rows_flushed);
+    println!("writer events processed {}", resp.writer_events_processed);
     println!("tls scan duration (us) {}", resp.tls_scan_duration_us);
     println!("tls scan errors        {}", resp.tls_scan_errors);
     println!(
@@ -141,12 +159,19 @@ fn cmd_tail(uds_path: &PathBuf, include_plaintext: bool) -> Result<()> {
         .set_read_timeout(Some(Duration::from_millis(300)))
         .ok();
     let reader = BufReader::new(stream);
+    let mut first = true;
     for line in reader.lines() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
         match line {
             Ok(l) => {
+                // A refused subscription (plaintext in protocol v2) is one error frame.
+                if std::mem::take(&mut first) {
+                    if let Ok(err) = serde_json::from_str::<ErrorResponse>(l.trim()) {
+                        return Err(anyhow!("tsd refused tail: {}", err.error));
+                    }
+                }
                 println!("{l}");
                 std::io::stdout().flush().ok();
             }

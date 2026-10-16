@@ -6,7 +6,6 @@
 //! tail rendering. Map entries are NOT cleared — cumulative until
 //! kernel LRU eviction.
 
-use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
@@ -14,19 +13,16 @@ use ts_bpf_sys::libbpf_rs::{MapCore, MapFlags, MapMut};
 use ts_core::{decode_net_bytes_key, decode_net_bytes_value};
 
 use crate::control::Counters;
-use crate::proc_cache::ProcessCache;
 use crate::sink::{EventEnvelope, NetBytesSnapshot};
 use crate::wall_clock_ns;
 
 pub fn flush(
     map: &MapMut<'_>,
-    cache: &RefCell<ProcessCache>,
     events_tx: &SyncSender<EventEnvelope>,
     counters: &Counters,
     stdout: bool,
 ) {
     let snapshot = wall_clock_ns();
-    let mut cache_mut = cache.borrow_mut();
     for raw_key in map.keys() {
         let key = match decode_net_bytes_key(&raw_key) {
             Ok(k) => k,
@@ -43,11 +39,10 @@ pub fn flush(
         if value.tx_bytes == 0 && value.rx_bytes == 0 {
             continue;
         }
-        let cmdline = cache_mut.get_or_load(value.pid).display_cmdline();
         let comm = value.comm_str();
         if stdout {
             println!(
-                "NetBytes {{ sock_cookie: {cookie:#018x}, pid: {pid}, comm: {comm:?}, cmdline: {cmdline:?}, tx: {tx}, rx: {rx}, last_ns: {ns} }}",
+                "NetBytes {{ sock_cookie: {cookie:#018x}, pid: {pid}, comm: {comm:?}, tx: {tx}, rx: {rx}, last_ns: {ns} }}",
                 cookie = key.sock_cookie,
                 pid = value.pid,
                 tx = value.tx_bytes,
@@ -64,7 +59,7 @@ pub fn flush(
                 sock_cookie: key.sock_cookie,
                 pid: value.pid,
                 comm,
-                cmdline,
+                _cmdline: String::new(),
                 tx_bytes: value.tx_bytes,
                 rx_bytes: value.rx_bytes,
                 last_event_ns: value.last_ns,

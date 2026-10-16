@@ -20,7 +20,7 @@ const PAYLOAD: &[u8] = &[b'P'; 1024];
 fn round_trips_events_through_duckdb() {
     let bin = env!("CARGO_BIN_EXE_tsd");
     let dir = TempDir::new().expect("tempdir");
-    let db_path = dir.path().join("events.duckdb");
+    let db_path = dir.path().join("private/usage.duckdb");
 
     let mut child = Command::new(bin)
         .args([

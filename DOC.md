@@ -2,7 +2,7 @@
 
 ## Overview
 
-TokenScope is a kernel-level eBPF observability platform for LLM workloads on Linux. The full vision and design are in `SPEC.md`. This document tracks what has actually shipped, configuration, and references for contributors.
+TokenScope is a kernel-level eBPF observability platform for LLM workloads on Linux. The full vision and design are in `SPEC.md`. This document separates the current implementation draft from historical release behavior.
 
 ## Getting Started
 
@@ -14,15 +14,132 @@ Cargo workspace layout:
 
 | Crate          | Purpose |
 |----------------|---------|
-| `ts-core`      | Shared types (event headers, enums) used by both the daemon and parsers. No I/O. |
+| `ts-core`      | Shared event/control types and bounded HTTP/1.1 usage reconstruction. No I/O. |
 | `ts-bpf-sys`   | Compiles `bpf/*.bpf.c` and re-exports `libbpf-cargo`-generated Rust skeletons. Build-time crate; no runtime logic. |
 | `tsd`          | Daemon binary. Loads BPF, drains ringbuf, prints events (Phase 0) → routes to pipeline (Phase 1+). |
-| `tsctl`        | CLI for ops. Phase 0: `--version` only. |
+| `tsctl`        | CLI status, metadata/usage tail and read-only SQL queries over the daemon's UDS. |
 | `tstop`        | TUI dashboard. Phase 0: stub. |
 
-BPF C code lives in `bpf/` and is compiled by `clang -target bpf`, then `bpftool gen skeleton` produces a Rust-friendly handle that's embedded into the binaries that use it.
+BPF C code lives in `bpf/`; `libbpf-cargo` compiles it with clang and generates
+Rust skeletons embedded in the binaries.
 
-## Phases
+## Current draft — reported usage, 2026-10-15
+
+Uncommitted on `research/accounting-validation`. Unprivileged checks and all
+ten privileged tests pass locally on kernel 7.0 with OpenSSL 3.5, including
+exact 5/3/8 usage from a real curl exchange. The supported path is
+dynamically linked OpenSSL, HTTP/1.1, `POST /v1/chat/completions` with Host
+`api.openai.com` (optionally port 443), and JSON or SSE responses. Association
+follows observed request order. HTTP/2, compressed and close-delimited bodies
+produce uncertainty reasons, never guesses. No report means absent usage, not
+zero; partial and conflicting reports stay distinct. Host and path classify a
+report as OpenAI-shaped; SNI, peer identity and certificates are not observed,
+so this does not prove OpenAI emitted it. Duplicate Content-Type headers and
+malformed usage-detail objects are rejected.
+
+Only provider lifetimes are parsed. A TLS lifetime whose first request goes to
+another Host, or whose peer speaks first (this process is the server), is
+released without rows. Lifetimes whose `SSL_new` was never observed get one
+`missing_lifecycle` row, not one per chunk.
+
+**Storage.** `events_usage` stores allowlisted numeric reports with capture
+epoch, process start, exec generation, SSL lifetime and request ordinal.
+`capture_integrity` is separate from `usage_state`: `observed_contiguous` means
+every byte of the exchange was observed in order; `observed_after_resync` means
+the same, but placing it relied on response resync (below). Neither proves
+complete transport coverage or billed usage. `events_tls_metadata` holds
+call/chunk/offset/loss metadata. Process arguments, headers, prompt and response
+content and content fingerprints never reach storage or tail. TLS plaintext
+stays in memory for parsing. The old plaintext tail option is refused in
+protocol v2.
+
+The default filename is `usage.duckdb`. Creation requires a private parent
+directory (0700) and sets the file to 0600 before any write. Existing legacy
+plaintext or non-usage files are inspected read-only and refused; keep them and
+choose a new path. Privacy tests inspect the database and a live WAL and check
+legacy byte/mode preservation. They do not cover crash recovery or power-loss
+durability.
+
+**Capture.** Probes record successful library-accepted bytes. Every record
+carries its lifetime identity, a per-direction call sequence and the stream
+byte offset before the call. All basic and `_ex` read/write entry/return
+probes and `SSL_new/free/clear` must attach before a per-library cookie enables
+capture; a library missing any of them is skipped. Successful SSL writes mean
+library acceptance, not server receipt.
+
+Losses come in three kinds:
+
+- *Sized:* ring reservation failure, user-copy failure, a dropped userspace
+  record, the uncaptured tail of a call over 64 KiB. The next record, closure
+  or inventory gives the exact number of missing bytes.
+- *Unsized, one lifetime:* nested calls, calls outside the tracked cgroups,
+  failed inflight bookkeeping, unreadable `_ex` out-parameters, thread exit
+  mid-call. These bump that lifetime's loss epoch, and it is invalidated.
+- *Unattributable:* undecodable records, ring poll errors, capture-control
+  failure at shutdown, a closure record lost before its inventory could be
+  read, overflow of the dropped-closure set. These invalidate every open
+  lifetime and every lifetime created before the loss was noticed.
+
+**Recovery.** A sized gap inside a length-delimited body that is being
+discarded (request bodies, responses that cannot carry provider usage) is
+skipped; framing survives because the length is known. A sized gap anywhere
+else in a response reports every request whose response may overlap it as
+`capture_gap`, then discards response bytes until the first read that entered
+after the client's next request write. That resync assumes the client does not
+pipeline: a request is written only after the previous response was read to the
+end. A response that begins while a later request is already outstanding marks
+the lifetime as pipelined, and its gaps invalidate it instead. A gap in a
+request head or chunked request body invalidates the lifetime. The replay
+ablation in [the 2026-10-15 research note](docs/research/2026-10-15-loss-recovery-ablation.md)
+measures the trade-off.
+
+**Lifetimes.** `SSL_free` closes a lifetime with final per-direction
+inventories; a clean close frees its parser slot. `SSL_clear` closes the old
+lifetime and starts a new generation on the same object: OpenSSL calls it
+before every first handshake, and applications call it to reuse an object. Every flush interval (default
+5 s) the daemon reads each kernel lifetime's call count, accepted bytes and loss
+epoch. Records can still be in transit, so accepted bytes ahead of those
+consumed count as lost only if still missing at the next pass. A lifetime whose
+process exited is removed from the kernel map one pass after the exit is seen,
+with an exact final inventory. A live lifetime missing from two consecutive
+passes lost its closure records (`closure_unobserved`). The final pass at
+shutdown runs after capture stopped and the ring drained, so it is exact.
+
+**Limits.** 1,024 live lifetimes; a lifetime beyond that gets one
+`connection_limit` row and is not parsed, and admission resumes once one
+closes. 65,536 retired identities are remembered so late records cannot
+restart them. 2 MiB per lifetime and 16 MiB in total of parser buffers; 16 KiB
+headers; 1 MiB buffered JSON response body; 256 KiB per SSE line or event; 16
+pending requests. Lifetimes stuck mid-message for 30 minutes expire as
+unverified; idle keep-alive lifetimes with nothing unreconciled stay valid. The
+4,096-event writer queue, temporary decoding allocations and DuckDB memory sit
+outside the buffer quota.
+
+The pinned cgroup filter is persistent and shared. Startup adds configured IDs
+without removing earlier ones, and another observer can change them, so the
+CLI list does not establish exclusive TLS scope. Live qualification must start
+with a fresh filter and no concurrent observer. Exec within a live process
+leaves the pre-exec lifetimes in the kernel map until the process exits.
+
+**Writer.** The writer drains accepted events through a FIFO shutdown marker and
+flushes on a deadline even under continuous ingestion. `tsctl status` shows the
+capture epoch, writer health, persistence errors, flushed rows, loss counters,
+refused and other-origin lifetimes, and swept lifetimes. Tail delivery does not
+prove persistence; flushed rows mean a successful application flush, not
+power-loss durability. Release builds abort on panic, so unwind cleanup is a
+development/test property only.
+
+Build, run and query commands are in [README.md](README.md). Checks and the
+remaining live gate are in the
+[implementation record](docs/research/2026-10-08-improvement-implementation.md#completion--2026-10-15).
+The September accounting experiments measured the archived versions named in
+their protocol, not this implementation.
+
+## Historical phases
+
+The sections below describe tagged releases. Their raw plaintext, command-line,
+hash and plaintext-tail behavior is historical and does not describe the current
+usage-monitor draft.
 
 ### Phase 2.A — TLS Plaintext Capture (shipped 2026-05-08, tag `v0.0.9-phase2a`)
 

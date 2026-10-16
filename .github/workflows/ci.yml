@@ -52,7 +52,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.86.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -76,4 +76,4 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
               "$(command -v cargo)" test -p tsd \
-              -- --include-ignored --nocapture
+              -- --include-ignored --nocapture --test-threads=1

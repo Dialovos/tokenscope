@@ -157,15 +157,27 @@ int BPF_PROG(handle_sendmsg, struct sock *sk, struct msghdr *msg, size_t size, i
 }
 
 /*
- * fexit/tcp_recvmsg.
- * Kernel signature (5.19+):
- *   int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
- *                   int flags, int *addr_len)
+ * fexit/tcp_recvmsg. The argument count varies by kernel, and fexit places the
+ * return value right after the last argument:
+ *   < 5.19: (sk, msg, len, nonblock, flags, addr_len)  -> ret at index 6
+ *   5.19+:  (sk, msg, len, flags, addr_len)            -> ret at index 5
+ *   7.0:    addr_len removed                           -> ret at index 4
+ * bpf_get_func_ret (5.17+) reads it without knowing the count. Kernels without
+ * the helper predate 5.19, so they use the six-argument layout. The relocation
+ * is a load-time constant; the verifier prunes the branch not taken.
  */
 SEC("fexit/tcp_recvmsg")
-int BPF_PROG(handle_recvmsg, struct sock *sk, struct msghdr *msg, size_t len,
-             int flags, int *addr_len, int ret)
+int BPF_PROG(handle_recvmsg, struct sock *sk)
 {
+    int ret;
+    if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_get_func_ret)) {
+        __u64 value = 0;
+        if (bpf_get_func_ret(ctx, &value))
+            return 0;
+        ret = (int)value;
+    } else {
+        ret = (int)ctx[6];
+    }
     if (ret <= 0)
         return 0;
     __u64 cookie = bpf_get_socket_cookie(sk);

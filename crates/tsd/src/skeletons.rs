@@ -45,16 +45,15 @@ impl Default for SkelStorage {
 /// Loaded + attached skeletons. The `_cgroup_links` and `_fexit_links`
 /// fields keep the BPF attachments alive (dropping them detaches).
 ///
-/// The `tls` skeleton is LOADED but has no probes attached yet — Task 9
-/// (the userspace TlsAttachManager) walks /proc and attaches per
-/// libssl.so. Loading early ensures the pinned `cgroup_filter` map
-/// exists in bpffs before any process tries to query it.
+/// The TLS thread-exit cleanup tracepoint is attached here. The userspace
+/// `TlsAttachManager` walks /proc to attach the library and lifecycle uprobes.
 pub struct LoadedSkels<'obj> {
     pub sched: SchedExecSkel<'obj>,
     pub net: NetSkel<'obj>,
     pub tls: TlsSkel<'obj>,
     _cgroup_links: Vec<Link>,
     _fexit_links: Vec<Link>,
+    _tls_exit_link: Link,
     _cgroup_root: File,
 }
 
@@ -121,6 +120,11 @@ pub fn load_all<'obj>(
         .set_pin_path(cgroup::CGROUP_FILTER_PIN)
         .map_err(|e| anyhow!("set cgroup_filter pin path: {e}"))?;
     let tls = tls_open.load().context("load tls skeleton")?;
+    let tls_exit_link = tls
+        .progs
+        .tls_thread_exit
+        .attach()
+        .context("attach TLS inflight thread-exit cleanup")?;
 
     // Populate the cgroup_filter map with the daemon's tracked ids.
     // Value is a single u8 sentinel (presence == "tracked").
@@ -139,6 +143,7 @@ pub fn load_all<'obj>(
         tls,
         _cgroup_links: vec![link4, link6],
         _fexit_links: vec![send_link, recv_link],
+        _tls_exit_link: tls_exit_link,
         _cgroup_root: cgroup_root,
     })
 }
